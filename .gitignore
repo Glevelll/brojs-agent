@@ -1,0 +1,31 @@
+# Секреты — НИКОГДА не в репо
+.env
+
+# Рабочая директория агента (клонированные репо, черновики)
+src/agent/agent_workspace/*
+!src/agent/agent_workspace/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LangGraph / LangSmith
+.langgraph_api/
