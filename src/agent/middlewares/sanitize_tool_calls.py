@@ -11,7 +11,8 @@ class SanitizeToolCallsMiddleware(AgentMiddleware[AgentState[Any], Any]):
     """Перехватывает вызовы инструментов с неизвестными именами и возвращает
     понятное сообщение об ошибке вместо падения рантайма."""
 
-    known_tools: set[str]
+    def __init__(self, known_tools: set[str]):
+        self.known_tools = known_tools
 
     def _reject(self, request) -> ToolMessage:
         name = request.tool_call.get("name", "")
