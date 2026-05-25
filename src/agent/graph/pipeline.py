@@ -1,8 +1,10 @@
 """LangGraph pipeline: последовательно выполняет все незакрытые задания курса."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import re
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage
@@ -80,12 +82,25 @@ _CODING_KW = [
     "code", "напиши", "реализуй", "python", "langchain", "langgraph",
     "агент", "agent", "граф", "graph", "файл", "функц", "программ",
     "скрипт", "алгоритм", "библиотек", "api", "сервер", "модуль", "класс",
+    # дополнительные ключевые слова для курса KFU-26-1
+    "ai", "llm", "rag", "mcp", "stream", "human", "interrupt", "middleware",
+    "память", "игра", "текст", "fluency", "практическ", "создай", "создайт",
+    "задание", "deep", "search", "поиск",
 ]
+
+# Задания, которые точно не требуют кода (теория, чтение)
+_NON_CODING_TITLES = []
 
 
 def _is_coding(task: TaskInfo) -> bool:
     title = (task.get("title") or "").lower()
-    return any(kw in title for kw in _CODING_KW)
+    if any(nc in title for nc in _NON_CODING_TITLES):
+        return False
+    # Если хотя бы одно кодинговое слово — берём задание
+    if any(kw in title for kw in _CODING_KW):
+        return True
+    # Для этого курса все задания — программирование, берём всё
+    return True
 
 
 async def _task_text(task_id: str) -> str:
@@ -162,10 +177,39 @@ def _fix_prompt(task: TaskInfo, repo_name: str, v: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Узлы графа
+# Вспомогательное: retry при rate-limit 429
 # ---------------------------------------------------------------------------
 
 MAX_RETRIES = 2
+RATE_LIMIT_RETRIES = 5        # сколько раз повторять при 429
+RATE_LIMIT_PAUSE   = 90       # секунд ожидания перед повтором
+TASK_PAUSE         = 15       # пауза между заданиями (снижает давление на rate limit)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """Проверяет, является ли исключение ошибкой rate-limit (429)."""
+    msg = str(exc)
+    return "429" in msg or "rate" in msg.lower() or "rate_limit" in msg.lower()
+
+
+async def _invoke_with_retry(agent, messages, config):
+    """Вызывает агента с автоматическим retry при 429."""
+    for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+        try:
+            return await agent.ainvoke(messages, config)
+        except Exception as e:
+            if _is_rate_limit(e) and attempt < RATE_LIMIT_RETRIES:
+                wait = RATE_LIMIT_PAUSE * attempt
+                print(f"[pipeline] Rate limit (попытка {attempt}/{RATE_LIMIT_RETRIES}), "
+                      f"жду {wait}с...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+
+# ---------------------------------------------------------------------------
+# Узлы графа
+# ---------------------------------------------------------------------------
 
 
 async def fetch_tasks(state: PipelineState) -> dict:
@@ -225,7 +269,11 @@ async def process_one_task(state: PipelineState) -> dict:
         agent_to_use = homework_direct_agent
 
     try:
-        result = await agent_to_use.ainvoke(
+        print(f"[pipeline] Задание {task_id[:8]} — {'пересдача' if is_rework else 'первая сдача'}: "
+              f"{task.get('title','')[:50]}")
+
+        result = await _invoke_with_retry(
+            agent_to_use,
             {"messages": [HumanMessage(content=prompt)]},
             {"configurable": {"thread_id": f"pipeline-task-{task_id}"}},
         )
@@ -243,12 +291,14 @@ async def process_one_task(state: PipelineState) -> dict:
             while _needs_retry(verification) and retries < MAX_RETRIES:
                 retries += 1
                 fix_msg = _fix_prompt(task, repo_name, verification)
-                result  = await agent_to_use.ainvoke(
+                result  = await _invoke_with_retry(
+                    agent_to_use,
                     {"messages": [HumanMessage(content=fix_msg)]},
                     {"configurable": {"thread_id": f"pipeline-task-{task_id}-retry-{retries}"}},
                 )
                 verification = await _verify_repo(repo_name)
 
+        print(f"[pipeline] Задание {task_id[:8]} — OK (retries={retries})")
         results.append({
             "task_id":      task_id,
             "status":       "done",
@@ -259,7 +309,12 @@ async def process_one_task(state: PipelineState) -> dict:
         })
 
     except Exception as e:
+        print(f"[pipeline] Задание {task_id[:8]} — ОШИБКА: {e}")
         errors.append(f"Задание {task_id} ({'rework' if is_rework else 'new'}): {e}")
+
+    # Пауза между заданиями чтобы не перегружать rate limit
+    print(f"[pipeline] Пауза {TASK_PAUSE}с перед следующим заданием...")
+    await asyncio.sleep(TASK_PAUSE)
 
     return {
         "results":       results,
