@@ -103,6 +103,40 @@ def _is_coding(task: TaskInfo) -> bool:
     return True
 
 
+async def _force_submit(task_id: str) -> bool:
+    """Гарантированно сабмитит задание через MCP напрямую, минуя LLM.
+
+    Вызывается пайплайном после того, как агент написал код в репо.
+    Возвращает True если сабмит прошёл успешно.
+    """
+    repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
+    update_tool = _get_journal_tool("task_update_answer")
+    submit_tool = _get_journal_tool("task_submit")
+    if not update_tool or not submit_tool:
+        print(f"[pipeline] force_submit: инструменты не найдены")
+        return False
+    try:
+        await update_tool.ainvoke({
+            "taskId":     task_id,
+            "answerType": "link",
+            "content":    repo_url,
+            "commit":     {"repoUrl": repo_url, "branch": "main"},
+        })
+        await submit_tool.ainvoke({"taskId": task_id, "confirmSubmit": True})
+        print(f"[pipeline] Задание {task_id[:8]} — сабмит выполнен пайплайном ✓")
+        return True
+    except Exception as e:
+        print(f"[pipeline] force_submit ошибка: {e}")
+        return False
+
+
+async def _is_submitted(task_id: str) -> bool:
+    """Проверяет, сменился ли статус задания на ready_for_review / done."""
+    data = await _task_json(task_id)
+    status = data.get("status", "")
+    return status in ("ready_for_review", "done")
+
+
 async def _task_text(task_id: str) -> str:
     tool = _get_journal_tool("task_text")
     if not tool:
@@ -297,6 +331,12 @@ async def process_one_task(state: PipelineState) -> dict:
                     {"configurable": {"thread_id": f"pipeline-task-{task_id}-retry-{retries}"}},
                 )
                 verification = await _verify_repo(repo_name)
+
+        # Гарантированный сабмит пайплайном — не полагаемся на LLM
+        submitted = await _is_submitted(task_id)
+        if not submitted:
+            print(f"[pipeline] Задание {task_id[:8]} — агент не сабмитил, делаем сами...")
+            await _force_submit(task_id)
 
         print(f"[pipeline] Задание {task_id[:8]} — OK (retries={retries})")
         results.append({
