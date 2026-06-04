@@ -317,6 +317,86 @@ async def generate(task_text: str, retries=5) -> dict:
 # Основная логика
 # ---------------------------------------------------------------------------
 
+COURSE_ID = "698b49da77cb6d4d2e43ce78"
+
+# ---------------------------------------------------------------------------
+# Автоматическая выборка todo-заданий
+# ---------------------------------------------------------------------------
+
+def _parse_todo_tasks(raw: str) -> list[str]:
+    """Парсит ответ tasks_list и возвращает ID заданий со статусом todo/in_progress."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    items = data.get("tasks", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        t      = item.get("task", item) if isinstance(item, dict) else {}
+        tid    = t.get("id", "")
+        status = item.get("status", "")
+        if tid and status in ("todo", "in_progress", "", None):
+            title = t.get("title", t.get("name", ""))
+            result.append((tid, title))
+    return result
+
+
+async def fetch_todo_tasks(course_id: str = COURSE_ID) -> list[tuple[str, str]]:
+    """Возвращает список (task_id, title) незакрытых заданий курса."""
+    print(f"[auto] Получаем список заданий курса {course_id}...")
+    raw = await mcp_call("tasks_list", {"courseId": course_id})
+    tasks = _parse_todo_tasks(raw)
+    print(f"[auto] Найдено todo-заданий: {len(tasks)}")
+    for tid, title in tasks:
+        print(f"  - {tid[:8]}... {title}")
+    return tasks
+
+
+# ---------------------------------------------------------------------------
+# Полный автоматический прогон
+# ---------------------------------------------------------------------------
+
+async def run_all(target_ids: list[str] | None = None, course_id: str = COURSE_ID):
+    """Решает все todo-задания курса (или только target_ids если указан список).
+
+    Это точка входа для run_pipeline.py — никакого ручного вызова не нужно.
+    """
+    if target_ids:
+        tasks = [(tid, "") for tid in target_ids]
+        print(f"[auto] Целевые задания: {target_ids}")
+    else:
+        tasks = await fetch_todo_tasks(course_id)
+
+    if not tasks:
+        print("[auto] Нет заданий для выполнения.")
+        return
+
+    results = []
+    for i, (task_id, title) in enumerate(tasks, 1):
+        print(f"\n[auto] Задание {i}/{len(tasks)}: {task_id[:8]}... {title}")
+        try:
+            repo_url = await solve(task_id)
+            results.append({"task_id": task_id, "status": "ok", "url": repo_url})
+        except Exception as e:
+            print(f"[auto] ОШИБКА при решении {task_id[:8]}: {e}")
+            results.append({"task_id": task_id, "status": "error", "error": str(e)})
+        # Пауза между заданиями
+        if i < len(tasks):
+            print("[auto] Пауза 15с перед следующим заданием...")
+            await asyncio.sleep(15)
+
+    print(f"\n{'='*60}")
+    print("ИТОГ:")
+    for r in results:
+        status_icon = "✅" if r["status"] == "ok" else "❌"
+        detail = r.get("url") or r.get("error", "")
+        print(f"  {status_icon} {r['task_id'][:8]}... → {detail}")
+    print('='*60)
+    return results
+
+
 async def solve(task_id: str):
     print(f"\n{'='*60}")
     print(f"Задание: {task_id}")
