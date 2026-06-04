@@ -211,6 +211,9 @@ _PROMPT = '''\
 
 ## ОБЯЗАТЕЛЬНЫЕ ТЕХНИЧЕСКИЕ ПАТТЕРНЫ
 
+> ⚠️ ЗАПРЕЩЕНО: langchain_ollama, OllamaEmbeddings, Ollama, langchain_community.
+> Для LLM и эмбеддингов — ТОЛЬКО OpenRouter через langchain_openai.
+
 ### LLM — всегда OpenRouter:
 ```python
 import os
@@ -268,32 +271,33 @@ if __name__ == "__main__":
 ```
 requirements.txt: deepagents, langchain-openai>=0.3.0, langchain>=1.2.10, langgraph>=0.2.0
 
-### RAG с Qdrant (для RAG-заданий):
+### RAG с ChromaDB (для RAG-заданий с ChromaDB):
 ```python
+# ВАЖНО: embeddings — ТОЛЬКО OpenAIEmbeddings через OpenRouter, НЕ OllamaEmbeddings!
 from langchain_openai import OpenAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small", base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENAI_API_KEY"))
-client = QdrantClient(":memory:")
-client.create_collection("knowledge", vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
-vector_store = QdrantVectorStore(client=client, collection_name="knowledge", embedding=embeddings)
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+vector_store = Chroma(collection_name="knowledge", embedding_function=embeddings)
 
 @tool
 def search_knowledge(query: str) -> str:
-    """Search the knowledge base."""
+    """Search the knowledge base for relevant information."""
     docs = vector_store.similarity_search(query, k=3)
     return "\\n".join(d.page_content for d in docs) if docs else "No results."
 
 @tool
 def add_to_knowledge(content: str, title: str = "doc") -> str:
-    """Add content to knowledge base."""
+    """Add content to the knowledge base."""
     vector_store.add_documents([Document(page_content=content, metadata={{"title": title}})])
     return f"Added: {{title}}"
 ```
-requirements.txt добавить: langchain-qdrant, qdrant-client
+requirements.txt добавить: langchain-chroma, chromadb
 
 ### Планирующий агент (для planning-заданий):
 ```python
