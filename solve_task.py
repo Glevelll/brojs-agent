@@ -43,14 +43,20 @@ llm = ChatOpenAI(
 )
 
 # ---------------------------------------------------------------------------
-# MCP — один клиент на весь запуск
+# MCP — один постоянный клиент на весь запуск
 # ---------------------------------------------------------------------------
 
 _mcp_tools: dict = {}
+_mcp_client = None          # держим клиент живым чтобы сессия не переоткрывалась
+_last_mcp_call_time = 0.0   # для паузы между вызовами
+
+# Exponential backoff: 15, 30, 60, 120, 240 секунд
+_BACKOFF = [15, 30, 60, 120, 240]
+_INTER_CALL_DELAY = 1.5     # секунд между последовательными MCP-вызовами
 
 
-async def _load_mcp(retries=5, pause=30):
-    global _mcp_tools
+async def _load_mcp():
+    global _mcp_tools, _mcp_client
     if _mcp_tools:
         return
     config = {
@@ -60,37 +66,47 @@ async def _load_mcp(retries=5, pause=30):
             "headers": {"Authorization": f"Bearer {JOURNAL_TOKEN}"},
         }
     }
-    client = MultiServerMCPClient(config)
-    for attempt in range(1, retries + 1):
+    _mcp_client = MultiServerMCPClient(config)
+    for i, pause in enumerate([0] + _BACKOFF):
         try:
-            tools = await client.get_tools(server_name="journal")
+            if pause:
+                print(f"  [mcp] 429 при загрузке, жду {pause}с (попытка {i+1})...")
+                await asyncio.sleep(pause)
+            tools = await _mcp_client.get_tools(server_name="journal")
             _mcp_tools = {t.name: t for t in tools}
             print(f"  [mcp] Загружено {len(_mcp_tools)} инструментов")
             return
         except Exception as e:
-            if "429" in str(e) and attempt < retries:
-                print(f"  [mcp] 429 при загрузке, жду {pause}с...")
-                await asyncio.sleep(pause)
-            else:
+            if "429" not in str(e) or i == len(_BACKOFF):
                 raise
 
 
-async def mcp_call(name: str, args: dict, retries=5, pause=30):
+async def mcp_call(name: str, args: dict):
+    global _last_mcp_call_time
     await _load_mcp()
+
+    # Пауза между вызовами — предотвращает burst
+    import time
+    elapsed = time.monotonic() - _last_mcp_call_time
+    if elapsed < _INTER_CALL_DELAY:
+        await asyncio.sleep(_INTER_CALL_DELAY - elapsed)
+
     tool = _mcp_tools.get(name)
     if not tool:
         raise RuntimeError(f"MCP tool '{name}' not found. Available: {list(_mcp_tools.keys())}")
-    for attempt in range(1, retries + 1):
+
+    for i, pause in enumerate([0] + _BACKOFF):
         try:
+            if pause:
+                print(f"  [mcp] {name} → 429, жду {pause}с (попытка {i+1})...")
+                await asyncio.sleep(pause)
             result = await tool.ainvoke(args)
+            _last_mcp_call_time = time.monotonic()
             if isinstance(result, list):
                 return next((x["text"] for x in result if x.get("type") == "text"), str(result))
             return str(result)
         except Exception as e:
-            if "429" in str(e) and attempt < retries:
-                print(f"  [mcp] {name} → 429, жду {pause}с (попытка {attempt}/{retries})...")
-                await asyncio.sleep(pause)
-            else:
+            if "429" not in str(e) or i == len(_BACKOFF):
                 raise
 
 
