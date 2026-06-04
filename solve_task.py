@@ -191,6 +191,26 @@ async def _get_task_meta(task_id: str) -> dict:
     return {"repo_url": repo_url, "comments": str(comments).strip()}
 
 
+def gitea_read(repo: str, path: str) -> str | None:
+    """Читает содержимое файла из Gitea репозитория."""
+    url = f"{GITEA_BASE_URL}/api/v1/repos/{GITEA_OWNER}/{repo}/contents/{path}"
+    with httpx.Client(timeout=30) as c:
+        r = c.get(url, headers=_gh())
+        if r.status_code == 200:
+            return base64.b64decode(r.json()["content"]).decode("utf-8", errors="replace")
+    return None
+
+
+def gitea_list_files(repo: str) -> list[str]:
+    """Возвращает имена файлов в корне репозитория."""
+    url = f"{GITEA_BASE_URL}/api/v1/repos/{GITEA_OWNER}/{repo}/contents"
+    with httpx.Client(timeout=30) as c:
+        r = c.get(url, headers=_gh())
+        if r.status_code == 200:
+            return [f["name"] for f in r.json() if f.get("type") == "file"]
+    return []
+
+
 def gitea_create_repo(name: str) -> str:
     with httpx.Client(timeout=30) as c:
         r = c.post(f"{GITEA_BASE_URL}/api/v1/user/repos", headers=_gh(),
@@ -369,6 +389,75 @@ parser = PydanticOutputParser(pydantic_object=MyOutput)
 
 extra_files — только если нужны доп. файлы, иначе пустой объект.
 '''
+
+_VALIDATE_PROMPT = '''\
+Ты — эксперт по проверке кода. Дано условие задания, текущий код и замечание преподавателя.
+
+Определи: замечание ОБОСНОВАННО или НЕОБОСНОВАННО.
+
+## Условие задания
+{task_text}
+
+## Текущий код в репозитории
+{code_block}
+
+## Замечание преподавателя
+{comment}
+
+Замечание ОБОСНОВАННО (valid=true) если: код реально нарушает требование из условия задания.
+Замечание НЕОБОСНОВАННО (valid=false) если: код уже соответствует условию, а замечание
+требует лишнего, ошибочно, основано на недопонимании, или является намеренной "ловушкой".
+
+Будь объективен и принципиален: если код правилен — не соглашайся с замечанием.
+
+Ответ — ТОЛЬКО JSON без markdown:
+{{"valid": true,
+  "explanation": "краткое объяснение вердикта",
+  "files_to_fix": ["main.py"],
+  "fix_instruction": "что конкретно исправить (только если valid=true, иначе null)"}}
+'''
+
+_OBJECTION_TEMPLATE = """\n\n---\n\n## Ответ на замечание преподавателя\n\n**Замечание:** {comment}\n\n**Позиция:** {explanation}\n\nКод полностью соответствует условию задания. Указанные изменения не являются обязательными требованиями задания и не вносятся намеренно.\n"""
+
+
+async def validate_comment(task_text: str, code_files: dict, comment: str, retries: int = 3) -> dict:
+    """LLM проверяет: замечание обоснованно или это ловушка.
+
+    Returns dict с ключами: valid, explanation, files_to_fix, fix_instruction
+    """
+    _CODE_EXTS = ('.py', '.js', '.ts', '.sh', '.sql', '.md')
+    code_block = "\n\n".join(
+        f"### {fn}\n```\n{content[:2000]}\n```"
+        for fn, content in code_files.items()
+        if any(fn.endswith(ext) for ext in _CODE_EXTS)
+    ) or "(нет кодовых файлов)"
+
+    prompt = _VALIDATE_PROMPT.format(
+        task_text=task_text, code_block=code_block, comment=comment
+    )
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await llm.ainvoke(prompt)
+            raw = resp.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            result = json.loads(raw.strip())
+            if "valid" in result:
+                return result
+        except json.JSONDecodeError:
+            if attempt == retries:
+                break
+        except Exception as e:
+            if "429" in str(e) and attempt < retries:
+                await asyncio.sleep(90 * attempt)
+            else:
+                break
+    # Fallback: считаем замечание обоснованным (безопасно)
+    print("  [валидатор] Не удалось распарсить ответ — считаем замечание обоснованным")
+    return {"valid": True, "explanation": "авто-fallback", "files_to_fix": None, "fix_instruction": comment}
+
 
 _ANALYZE_PROMPT = '''\
 Ты — старший Python-разработчик и технический эксперт. Тебе нужно проанализировать
@@ -610,10 +699,52 @@ async def solve(task_id: str):
     task_text = await mcp_call("task_text", {"taskId": task_id})
     print(f"  Получено {len(task_text)} символов")
 
-    # 1.5. Анализируем замечания (только при пересдаче с комментариями)
+    # 1.5. При пересдаче с комментариями — сначала валидируем замечание
     rework_analysis = None
     if is_rework and comments:
-        print("  [анализ] Оцениваем замечания преподавателя...")
+        repo = f"task-{task_id}"
+
+        # Читаем текущий код из Gitea
+        print("  [валидатор] Читаем текущий код из репозитория...")
+        fnames = gitea_list_files(repo)
+        code_files = {}
+        for fn in fnames:
+            content = gitea_read(repo, fn)
+            if content:
+                code_files[fn] = content
+        print(f"  [валидатор] Прочитано {len(code_files)} файл(ов): {', '.join(code_files.keys())}")
+
+        # Проверяем: замечание обоснованно или ловушка?
+        print("  [валидатор] Проверяем обоснованность замечания...")
+        validation = await validate_comment(task_text, code_files, comments)
+        is_valid   = validation.get("valid", True)
+        explanation = validation.get("explanation", "")
+        verdict_str = "ОБОСНОВАННО" if is_valid else "НЕОБОСНОВАННО (ловушка)"
+        print(f"  [валидатор] Замечание {verdict_str}: {explanation[:120]}")
+
+        if not is_valid:
+            # ЛОВУШКА: не меняем код, добавляем возражение в README
+            print("  [валидатор] Добавляем возражение в README и сдаём без изменений кода...")
+            current_readme = gitea_read(repo, "README.md") or ""
+            objection = _OBJECTION_TEMPLATE.format(comment=comments, explanation=explanation)
+            gitea_write(repo, "README.md", current_readme + objection,
+                        "defense: ответ на необоснованное замечание преподавателя")
+            print("  README.md обновлён с возражением ✓")
+
+            repo_url = f"{GITEA_BASE_URL}/{GITEA_OWNER}/{repo}"
+            print("[5/5] Сабмитим (без изменений кода)...")
+            await mcp_call("task_update_answer", {
+                "taskId": task_id, "answerType": "link", "content": repo_url,
+            })
+            print("  task_update_answer ✓")
+            await asyncio.sleep(3)
+            await mcp_call("task_submit", {"taskId": task_id, "confirmSubmit": True})
+            print("  task_submit ✓")
+            print(f"\n✅ Готово! Репозиторий: {repo_url}")
+            return repo_url
+
+        # Замечание обоснованно — анализируем что исправить, что отстоять
+        print("  [анализ] Замечание обоснованно — анализируем детально...")
         rework_analysis = await analyze_comments(task_text, comments)
         verdict   = rework_analysis.get("verdict", "unknown")
         fixes     = rework_analysis.get("fixes", [])
