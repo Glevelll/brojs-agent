@@ -355,20 +355,77 @@ parser = PydanticOutputParser(pydantic_object=MyOutput)
 extra_files — только если нужны доп. файлы, иначе пустой объект.
 '''
 
-_REWORK_SECTION = '''\
-## ПЕРЕСДАЧА — комментарии преподавателя
-Предыдущее решение было отклонено. Обязательно учти замечания:
+_ANALYZE_PROMPT = '''\
+Ты — опытный Python-разработчик. Проанализируй комментарии преподавателя к решению
+учебного задания и вынеси вердикт по каждому пункту.
 
+## Текст задания
+{task_text}
+
+## Комментарии преподавателя
 {comments}
 
-Исправь именно то, что указано выше. Не меняй то, что работало правильно.
+Для каждого замечания:
+- Если оно технически справедливо → внеси в "fixes" (что именно исправить)
+- Если исходное решение было верным и замечание ошибочно или основано на недопонимании →
+  внеси в "defenses" в формате "замечание: ОБЪЯСНЕНИЕ почему решение правильное"
+
+Ответ — ТОЛЬКО JSON без markdown:
+{{"fixes": ["список конкретных исправлений"],
+  "defenses": ["замечание: объяснение"],
+  "verdict": "needs_fixes" | "already_correct" | "mixed"}}
+'''
+
+_REWORK_SECTION = '''\
+## ПЕРЕСДАЧА — результат анализа замечаний
+
+### Исправить (замечания справедливы):
+{fixes}
+
+### Оставить и объяснить (решение было верным):
+{defenses}
+
+Правила:
+- Вноси ТОЛЬКО изменения из раздела "Исправить"
+- Для каждого пункта из "Оставить" — добавь в код комментарий "# NOTE: <объяснение>"
+- Не трогай логику, которая работала правильно
 '''
 
 
-async def generate(task_text: str, rework_comments: str = "", retries=5) -> dict:
-    rework_section = (
-        _REWORK_SECTION.format(comments=rework_comments) if rework_comments else ""
-    )
+async def analyze_comments(task_text: str, comments: str, retries: int = 3) -> dict:
+    """LLM оценивает замечания преподавателя: что исправить, что отстоять."""
+    prompt = _ANALYZE_PROMPT.format(task_text=task_text, comments=comments)
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await llm.ainvoke(prompt)
+            raw = resp.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
+        except json.JSONDecodeError as e:
+            if attempt == retries:
+                # Если LLM не дал валидный JSON — возвращаем «исправить всё»
+                print(f"  [анализ] JSON parse error: {e}. Fallback: исправить всё.")
+                return {"fixes": [comments], "defenses": [], "verdict": "needs_fixes"}
+        except Exception as e:
+            if "429" in str(e) and attempt < retries:
+                wait = 90 * attempt
+                print(f"  [анализ] 429, жду {wait}с...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  [анализ] Ошибка: {e}. Fallback: исправить всё.")
+                return {"fixes": [comments], "defenses": [], "verdict": "needs_fixes"}
+
+
+async def generate(task_text: str, rework_analysis: dict | None = None, retries=5) -> dict:
+    if rework_analysis:
+        fixes    = "\n".join(f"- {f}" for f in rework_analysis.get("fixes", [])) or "— нет"
+        defenses = "\n".join(f"- {d}" for d in rework_analysis.get("defenses", [])) or "— нет"
+        rework_section = _REWORK_SECTION.format(fixes=fixes, defenses=defenses)
+    else:
+        rework_section = ""
     prompt = _PROMPT.format(task_text=task_text, rework_section=rework_section)
     for attempt in range(1, retries + 1):
         try:
@@ -522,9 +579,23 @@ async def solve(task_id: str):
     task_text = await mcp_call("task_text", {"taskId": task_id})
     print(f"  Получено {len(task_text)} символов")
 
-    # 2. Генерируем код (с учётом комментариев если пересдача)
+    # 1.5. Анализируем замечания (только при пересдаче с комментариями)
+    rework_analysis = None
+    if is_rework and comments:
+        print("  [анализ] Оцениваем замечания преподавателя...")
+        rework_analysis = await analyze_comments(task_text, comments)
+        verdict   = rework_analysis.get("verdict", "unknown")
+        fixes     = rework_analysis.get("fixes", [])
+        defenses  = rework_analysis.get("defenses", [])
+        print(f"  [анализ] Вердикт: {verdict}")
+        if fixes:
+            print(f"  [анализ] Исправить {len(fixes)} пункт(ов)")
+        if defenses:
+            print(f"  [анализ] Отстоять {len(defenses)} пункт(ов)")
+
+    # 2. Генерируем код
     print("[2/5] Генерируем код (1 LLM-вызов)...")
-    solution = await generate(task_text, rework_comments=comments if is_rework else "")
+    solution = await generate(task_text, rework_analysis=rework_analysis if is_rework else None)
     main_py      = solution.get("main_py", "")
     requirements = solution.get("requirements_txt", "")
     extra        = solution.get("extra_files", {})
@@ -537,7 +608,15 @@ async def solve(task_id: str):
     print(f"  {repo_url}")
 
     # 4. Пушим файлы
-    commit_prefix = "fix:" if is_rework else "add"
+    if is_rework and rework_analysis:
+        verdict = rework_analysis.get("verdict", "")
+        n_fixes = len(rework_analysis.get("fixes", []))
+        n_def   = len(rework_analysis.get("defenses", []))
+        commit_prefix = f"fix({verdict}): {n_fixes} исправлений, {n_def} отстояно —"
+    elif is_rework:
+        commit_prefix = "fix:"
+    else:
+        commit_prefix = "add:"
     print("[4/5] Пушим файлы...")
     gitea_write(repo, "main.py", main_py, f"{commit_prefix} main.py")
     print("  main.py ✓")
