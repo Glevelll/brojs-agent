@@ -1,6 +1,7 @@
 """Загрузка инструментов BroJS Journal через MCP (HTTP transport)."""
 import asyncio
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -16,6 +17,15 @@ JOURNAL_PREFIX      = f"mcp__{JOURNAL_SERVER_NAME}__"
 _JOURNAL_TOKEN = os.getenv("JOURNAL_TOKEN", "YOUR_JOURNAL_TOKEN_HERE")
 
 JOURNAL_MCP_URL = "https://platform.brojs.ru/jrnl-bh/api/mcp"
+
+# Exponential backoff: 15, 30, 60, 120, 240 секунд
+_BACKOFF = [15, 30, 60, 120, 240]
+# Минимальная пауза между последовательными MCP-вызовами (предотвращает burst)
+_INTER_CALL_DELAY = 1.5
+
+# Персистентный клиент и время последнего вызова — переиспользуются в рамках одного запуска
+_persistent_client: MultiServerMCPClient | None = None
+_last_mcp_call_time: float = 0.0
 
 # Инструменты для работы с курсами и уроками
 JOURNAL_COURSES_LESSONS = frozenset({
@@ -44,7 +54,7 @@ class JournalToolsets:
 def _build_mcp_config() -> dict:
     return {
         JOURNAL_SERVER_NAME: {
-            "transport": "http",
+            "transport": "streamable_http",
             "url": JOURNAL_MCP_URL,
             "headers": {
                 "Authorization": f"Bearer {_JOURNAL_TOKEN}",
@@ -53,16 +63,43 @@ def _build_mcp_config() -> dict:
     }
 
 
+def _is_429(exc: Exception) -> bool:
+    return "429" in str(exc)
+
+
 async def _fetch_tools() -> dict[str, list]:
+    """Загружает MCP-инструменты с персистентным клиентом и экспоненциальным backoff при 429."""
+    global _persistent_client, _last_mcp_call_time
+
+    # Пауза между последовательными вызовами — предотвращает burst
+    elapsed = time.monotonic() - _last_mcp_call_time
+    if elapsed < _INTER_CALL_DELAY:
+        await asyncio.sleep(_INTER_CALL_DELAY - elapsed)
+
     config = _build_mcp_config()
-    client = MultiServerMCPClient(config)
+
+    # Переиспользуем клиент если уже создан
+    if _persistent_client is None:
+        _persistent_client = MultiServerMCPClient(config)
+
     out: dict[str, list] = {}
     for name in config:
-        try:
-            out[name] = await client.get_tools(server_name=name)
-        except Exception as exc:
-            print(f"MCP '{name}': не удалось загрузить инструменты — {type(exc).__name__}: {exc}")
-            out[name] = []
+        for i, pause in enumerate([0] + _BACKOFF):
+            try:
+                if pause:
+                    print(f"  [mcp_client] '{name}' → 429, жду {pause}с (попытка {i+1})...")
+                    await asyncio.sleep(pause)
+                out[name] = await _persistent_client.get_tools(server_name=name)
+                _last_mcp_call_time = time.monotonic()
+                break
+            except Exception as exc:
+                if _is_429(exc) and i < len(_BACKOFF):
+                    continue
+                print(f"MCP '{name}': не удалось загрузить инструменты — {type(exc).__name__}: {exc}")
+                # При неизвестной ошибке пересоздаём клиент перед следующей попыткой
+                _persistent_client = MultiServerMCPClient(config)
+                out[name] = []
+                break
     return out
 
 
