@@ -389,6 +389,29 @@ async def fetch_todo_tasks(course_id: str = COURSE_ID) -> list[tuple[str, str]]:
     return tasks
 
 
+async def fetch_all_tasks(course_id: str = COURSE_ID) -> list[dict]:
+    """Возвращает все задания курса с их статусами (для мониторинга)."""
+    raw = await mcp_call("tasks_list", {"courseId": course_id})
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    items = data.get("tasks", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        t = item.get("task", item) if isinstance(item, dict) else {}
+        tid = t.get("id", "")
+        if tid:
+            result.append({
+                "id":     tid,
+                "title":  t.get("title", t.get("name", "")),
+                "status": item.get("status", ""),
+            })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Полный автоматический прогон
 # ---------------------------------------------------------------------------

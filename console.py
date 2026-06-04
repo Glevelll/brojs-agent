@@ -17,7 +17,7 @@ os.environ["NO_PROXY"] = "openrouter.ai,platform.brojs.ru,git.brojs.ru," + os.en
 from dotenv import load_dotenv
 load_dotenv()
 
-from solve_task import fetch_todo_tasks, solve, run_all
+from solve_task import fetch_todo_tasks, fetch_all_tasks, solve, run_all
 
 HELP = """
 Команды:
@@ -53,9 +53,15 @@ async def main():
             print(HELP)
 
         elif cmd == "tasks":
-            tasks = await fetch_todo_tasks()
+            tasks = await fetch_all_tasks()
             if not tasks:
-                print("  Нет активных заданий.")
+                print("  Заданий не найдено.")
+            else:
+                print(f"\n  {'ID':10}  {'Статус':20}  Название")
+                print(f"  {'-'*10}  {'-'*20}  {'-'*40}")
+                for t in tasks:
+                    print(f"  {t['id'][:8]}...  {t['status']:20}  {t['title']}")
+                print()
 
         elif cmd.startswith("solve "):
             task_id = cmd.split(" ", 1)[1].strip()
