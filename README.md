@@ -22,6 +22,20 @@ AI-агент для автоматического выполнения зад�
 - Gitea REST API (git.brojs.ru)
 - BroJS Journal MCP (platform.brojs.ru)
 
+## Почему OpenRouter, а не Ollama
+
+Все решения используют **OpenRouter** (`https://openrouter.ai/api/v1`) с моделью `openai/gpt-oss-20b:free` через стандартный `langchain_openai.ChatOpenAI`.
+
+| Критерий | OpenRouter | Ollama (локальная) |
+|---|---|---|
+| Требования к железу | Нет (облако) | GPU / 8–16 GB RAM |
+| Совместимость с LangChain | Полная (OpenAI-совместимый API) | Требует отдельного провайдера |
+| Смена модели | Одна строка в коде | Скачать новую модель (~GB) |
+| CI / автоматизация | Работает из любой среды | Нужен локальный сервер |
+| Стоимость | Бесплатный тир (`gpt-oss-20b:free`) | Бесплатно, но ресурсоёмко |
+
+Ключ хранится в `.env` как `OPENAI_API_KEY=sk-or-v1-...` — формат совместим с OpenAI SDK, поэтому смена провайдера (OpenAI, Azure, Ollama) не требует изменений в коде, только `.env`.
+
 ## Установка
 
 ```bash

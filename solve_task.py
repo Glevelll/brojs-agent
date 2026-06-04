@@ -215,6 +215,11 @@ _PROMPT = '''\
 ```python
 import os
 from langchain_openai import ChatOpenAI
+
+# Используем OpenRouter вместо Ollama: облачный API не требует локального GPU,
+# совместим с OpenAI SDK «из коробки» (только base_url), легко масштабируется.
+# Модель gpt-oss-20b:free — бесплатный тир OpenRouter для учебных задач.
+# Ключ OPENAI_API_KEY=sk-or-v1-... хранится в .env (не в репозитории).
 llm = ChatOpenAI(
     model="openai/gpt-oss-20b:free",
     base_url="https://openrouter.ai/api/v1",
