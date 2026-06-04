@@ -5,10 +5,27 @@
     python run_pipeline.py <id1> <id2>  # решить конкретные задания по ID
 """
 import asyncio
+import io
 import os
 import sys
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
+# Перенастраиваем stdout/stderr на UTF-8 уже после старта Python
+# Используем reconfigure() — безопасно при любом типе перенаправления вывода.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    elif hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    elif hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["NO_PROXY"] = (
     "openrouter.ai,platform.brojs.ru,git.brojs.ru,"

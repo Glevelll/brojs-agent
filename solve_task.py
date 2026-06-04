@@ -8,9 +8,28 @@
 """
 import asyncio
 import base64
+import io
 import json
 import os
 import sys
+
+# Перенастраиваем stdout/stderr на UTF-8 (Windows cp1251 не осиливает →, ✅ и т.д.)
+# reconfigure() меняет кодировку у существующего враппера на месте — безопаснее, чем
+# создавать новый TextIOWrapper поверх буфера (последнее ломается при перенаправлении в файл).
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    elif hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    elif hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Обходим локальный прокси
 os.environ["NO_PROXY"] = "openrouter.ai,platform.brojs.ru,git.brojs.ru," + os.environ.get("NO_PROXY", "")
@@ -55,6 +74,23 @@ _BACKOFF = [15, 30, 60, 120, 240]
 _INTER_CALL_DELAY = 1.5     # секунд между последовательными MCP-вызовами
 
 
+def _is_429(exc: BaseException) -> bool:
+    """Рекурсивно проверяет, содержит ли исключение (или вложенные) ошибку 429.
+
+    Нужно потому что anyio оборачивает HTTP-ошибки в ExceptionGroup,
+    и '429' есть только во вложенном исключении, а не в str(ExceptionGroup).
+    """
+    if "429" in str(exc):
+        return True
+    # ExceptionGroup (Python 3.11+ / anyio): смотрим вложенные
+    if hasattr(exc, "exceptions"):
+        return any(_is_429(sub) for sub in exc.exceptions)
+    # __cause__ / __context__
+    if exc.__cause__ is not None and exc.__cause__ is not exc:
+        return _is_429(exc.__cause__)
+    return False
+
+
 async def _load_mcp():
     global _mcp_tools, _mcp_client
     if _mcp_tools:
@@ -76,8 +112,8 @@ async def _load_mcp():
             _mcp_tools = {t.name: t for t in tools}
             print(f"  [mcp] Загружено {len(_mcp_tools)} инструментов")
             return
-        except Exception as e:
-            if "429" not in str(e) or i == len(_BACKOFF):
+        except BaseException as e:
+            if not _is_429(e) or i == len(_BACKOFF):
                 raise
 
 
@@ -105,8 +141,8 @@ async def mcp_call(name: str, args: dict):
             if isinstance(result, list):
                 return next((x["text"] for x in result if x.get("type") == "text"), str(result))
             return str(result)
-        except Exception as e:
-            if "429" not in str(e) or i == len(_BACKOFF):
+        except BaseException as e:
+            if not _is_429(e) or i == len(_BACKOFF):
                 raise
 
 
