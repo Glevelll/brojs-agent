@@ -10,10 +10,10 @@ from typing import TypedDict
 from langchain_core.messages import HumanMessage
 from langgraph.graph import START, StateGraph
 
-from src.agent.agent import homework_direct_agent, rework_agent
+from src.agent.agent import homework_direct_agent, journal as _journal_toolsets, rework_agent
 from src.agent.constants import COURSE_ID, GITEA_OWNER
 from src.agent.gitea_tools import _get as gitea_get
-from src.agent.mcp_client import JOURNAL_PREFIX, load_journal_toolsets
+from src.agent.mcp_client import JOURNAL_PREFIX
 
 # ---------------------------------------------------------------------------
 # Типы состояния
@@ -36,11 +36,8 @@ class PipelineState(TypedDict):
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
-_journal = load_journal_toolsets()
-
-
 def _get_journal_tool(suffix: str):
-    all_tools = _journal.courses_lessons_tools + _journal.tasks_submissions_tools
+    all_tools = _journal_toolsets.courses_lessons_tools + _journal_toolsets.tasks_submissions_tools
     target = f"{JOURNAL_PREFIX}{suffix}"
     for t in all_tools:
         if t.name == target:
@@ -116,13 +113,13 @@ async def _force_submit(task_id: str) -> bool:
         print(f"[pipeline] force_submit: инструменты не найдены")
         return False
     try:
-        await update_tool.ainvoke({
+        await _mcp_invoke(update_tool, {
             "taskId":     task_id,
             "answerType": "link",
             "content":    repo_url,
             "commit":     {"repoUrl": repo_url, "branch": "main"},
         })
-        await submit_tool.ainvoke({"taskId": task_id, "confirmSubmit": True})
+        await _mcp_invoke(submit_tool, {"taskId": task_id, "confirmSubmit": True})
         print(f"[pipeline] Задание {task_id[:8]} — сабмит выполнен пайплайном ✓")
         return True
     except Exception as e:
@@ -137,12 +134,25 @@ async def _is_submitted(task_id: str) -> bool:
     return status in ("ready_for_review", "done")
 
 
+async def _mcp_invoke(tool, args: dict, retries: int = 5, pause: int = 30):
+    """Вызывает MCP-инструмент с retry при 429."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await tool.ainvoke(args)
+        except Exception as e:
+            if "429" in str(e) and attempt < retries:
+                print(f"[pipeline] MCP 429, жду {pause}с (попытка {attempt}/{retries})...")
+                await asyncio.sleep(pause)
+            else:
+                raise
+
+
 async def _task_text(task_id: str) -> str:
     tool = _get_journal_tool("task_text")
     if not tool:
         return ""
     try:
-        return _parse_text(await tool.ainvoke({"taskId": task_id}))
+        return _parse_text(await _mcp_invoke(tool, {"taskId": task_id}))
     except Exception:
         return ""
 
@@ -152,7 +162,7 @@ async def _task_json(task_id: str) -> dict:
     if not tool:
         return {}
     try:
-        raw = _parse_text(await tool.ainvoke({"taskId": task_id}))
+        raw = _parse_text(await _mcp_invoke(tool, {"taskId": task_id}))
         return json.loads(raw)
     except Exception:
         return {}
@@ -276,6 +286,10 @@ async def process_one_task(state: PipelineState) -> dict:
     results  = list(state.get("results", []))
     errors   = list(state.get("errors", []))
 
+    # Пауза перед стартом — даём BroJS MCP сбросить rate limit после загрузки инструментов
+    print(f"[pipeline] Задание {task_id[:8]} — пауза 10с перед стартом...")
+    await asyncio.sleep(10)
+
     repo_url  = await _existing_repo_url(task_id)
     is_rework = repo_url is not None
 
@@ -348,8 +362,16 @@ async def process_one_task(state: PipelineState) -> dict:
             "retries":      retries,
         })
 
-    except Exception as e:
-        print(f"[pipeline] Задание {task_id[:8]} — ОШИБКА: {e}")
+    except BaseException as e:
+        import traceback
+        # Разворачиваем ExceptionGroup (Python 3.11+) чтобы увидеть реальные ошибки
+        if isinstance(e, ExceptionGroup):
+            for i, sub in enumerate(e.exceptions):
+                print(f"[pipeline] Задание {task_id[:8]} — под-ошибка {i+1}: {type(sub).__name__}: {sub}")
+                traceback.print_exception(type(sub), sub, sub.__traceback__)
+        else:
+            print(f"[pipeline] Задание {task_id[:8]} — ОШИБКА: {type(e).__name__}: {e}")
+            traceback.print_exc()
         errors.append(f"Задание {task_id} ({'rework' if is_rework else 'new'}): {e}")
 
     # Пауза между заданиями чтобы не перегружать rate limit

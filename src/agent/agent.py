@@ -12,7 +12,7 @@ from src.agent.constants import (
 from src.agent.gitea_tools import GITEA_TOOLS
 from src.agent.llm import llm
 from src.agent.mcp_client import load_journal_toolsets
-from src.agent.middlewares import SanitizeToolCallsMiddleware, ValidateJournalWorkflowMiddleware
+from src.agent.middlewares import RetryOnRateLimitMiddleware, SanitizeToolCallsMiddleware, ValidateJournalWorkflowMiddleware
 from src.agent.prompts import (
     homework_doing_instructions,
     main_agent_instructions,
@@ -129,6 +129,7 @@ homework_direct_agent = create_deep_agent(
     system_prompt=homework_doing_instructions,
     backend=_composite_backend,
     middleware=[
+        RetryOnRateLimitMiddleware(),
         SanitizeToolCallsMiddleware(known_tools=_subagent_tool_names["homework_doing"]),
         ValidateJournalWorkflowMiddleware(),
     ],
@@ -144,6 +145,7 @@ rework_agent = create_deep_agent(
     system_prompt=rework_instructions,
     backend=_composite_backend,
     middleware=[
+        RetryOnRateLimitMiddleware(),
         SanitizeToolCallsMiddleware(known_tools=_subagent_tool_names["homework_doing"]),
         ValidateJournalWorkflowMiddleware(),
     ],

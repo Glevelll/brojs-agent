@@ -1,3 +1,2 @@
-from src.agent.agent import agent, homework_direct_agent, rework_agent
-
-__all__ = ["agent", "homework_direct_agent", "rework_agent"]
+# Намеренно пустой — предотвращает двойную загрузку MCP при импорте подмодулей.
+# Импортируй напрямую: from src.agent.agent import agent
