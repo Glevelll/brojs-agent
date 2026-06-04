@@ -118,6 +118,28 @@ def _gh():
     return {"Authorization": f"token {GITEA_TOKEN}", "Content-Type": "application/json"}
 
 
+async def _get_task_meta(task_id: str) -> dict:
+    """Возвращает существующий repo_url и комментарии преподавателя (если есть).
+
+    Используется для определения: первая сдача или пересдача после отклонения.
+    """
+    try:
+        raw = await mcp_call("task_get", {"taskId": task_id})
+        data = json.loads(raw)
+        url = (data.get("answer") or {}).get("content", "")
+        repo_url = url if url.startswith(f"{GITEA_BASE_URL}/{GITEA_OWNER}/") else None
+        comments = data.get("comments") or data.get("feedback", "") or ""
+        # comments может быть списком объектов
+        if isinstance(comments, list):
+            comments = "\n".join(
+                c.get("text", c.get("content", str(c))) for c in comments if c
+            )
+        return {"repo_url": repo_url, "comments": str(comments).strip()}
+    except Exception as e:
+        print(f"  [meta] Не удалось получить метаданные задания: {e}")
+        return {"repo_url": None, "comments": ""}
+
+
 def gitea_create_repo(name: str) -> str:
     with httpx.Client(timeout=30) as c:
         r = c.post(f"{GITEA_BASE_URL}/api/v1/user/repos", headers=_gh(),
@@ -281,15 +303,28 @@ parser = PydanticOutputParser(pydantic_object=MyOutput)
 - ОБЯЗАТЕЛЬНО использовать create_deep_agent из deepagents
 - requirements.txt: deepagents, langchain>=1.2.10, langchain-openai>=0.3.0, langgraph>=0.2.0 + нужные доп. зависимости
 
+{rework_section}
 ## Ответ — ТОЛЬКО JSON без markdown:
 {{"main_py": "...", "requirements_txt": "...", "extra_files": {{}}}}
 
 extra_files — только если нужны доп. файлы, иначе пустой объект.
 '''
 
+_REWORK_SECTION = '''\
+## ПЕРЕСДАЧА — комментарии преподавателя
+Предыдущее решение было отклонено. Обязательно учти замечания:
 
-async def generate(task_text: str, retries=5) -> dict:
-    prompt = _PROMPT.format(task_text=task_text)
+{comments}
+
+Исправь именно то, что указано выше. Не меняй то, что работало правильно.
+'''
+
+
+async def generate(task_text: str, rework_comments: str = "", retries=5) -> dict:
+    rework_section = (
+        _REWORK_SECTION.format(comments=rework_comments) if rework_comments else ""
+    )
+    prompt = _PROMPT.format(task_text=task_text, rework_section=rework_section)
     for attempt in range(1, retries + 1):
         try:
             print(f"  [llm] Генерирую решение (попытка {attempt})...")
@@ -402,33 +437,46 @@ async def solve(task_id: str):
     print(f"Задание: {task_id}")
     print('='*60)
 
+    # 0. Проверяем: первая сдача или пересдача
+    print("[0/5] Проверяем статус задания...")
+    meta      = await _get_task_meta(task_id)
+    is_rework = meta["repo_url"] is not None
+    comments  = meta["comments"]
+    if is_rework:
+        print(f"  ⟳ ПЕРЕСДАЧА (репо уже есть: {meta['repo_url']})")
+        if comments:
+            print(f"  Комментарии преподавателя: {comments[:200]}")
+    else:
+        print("  ✦ Первая сдача")
+
     # 1. Читаем текст задания
     print("[1/5] Читаем текст задания...")
     task_text = await mcp_call("task_text", {"taskId": task_id})
     print(f"  Получено {len(task_text)} символов")
 
-    # 2. Генерируем код
+    # 2. Генерируем код (с учётом комментариев если пересдача)
     print("[2/5] Генерируем код (1 LLM-вызов)...")
-    solution = await generate(task_text)
+    solution = await generate(task_text, rework_comments=comments if is_rework else "")
     main_py      = solution.get("main_py", "")
     requirements = solution.get("requirements_txt", "")
     extra        = solution.get("extra_files", {})
     print(f"  main.py: {len(main_py)} символов, requirements.txt: {len(requirements)} символов")
 
-    # 3. Создаём репо
+    # 3. Создаём репо (при пересдаче — 409, вернёт существующий URL)
     repo = f"task-{task_id}"
-    print(f"[3/5] Создаём репозиторий {repo}...")
+    print(f"[3/5] {'Обновляем' if is_rework else 'Создаём'} репозиторий {repo}...")
     repo_url = gitea_create_repo(repo)
     print(f"  {repo_url}")
 
     # 4. Пушим файлы
+    commit_prefix = "fix:" if is_rework else "add"
     print("[4/5] Пушим файлы...")
-    gitea_write(repo, "main.py", main_py, "add main.py")
+    gitea_write(repo, "main.py", main_py, f"{commit_prefix} main.py")
     print("  main.py ✓")
-    gitea_write(repo, "requirements.txt", requirements, "add requirements.txt")
+    gitea_write(repo, "requirements.txt", requirements, f"{commit_prefix} requirements.txt")
     print("  requirements.txt ✓")
     for fname, fcontent in extra.items():
-        gitea_write(repo, fname, fcontent, f"add {fname}")
+        gitea_write(repo, fname, fcontent, f"{commit_prefix} {fname}")
         print(f"  {fname} ✓")
 
     # 5. Сабмитим
