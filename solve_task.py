@@ -177,10 +177,20 @@ async def _get_task_meta(task_id: str) -> dict:
         print(f"  [meta] Не удалось проверить Gitea: {e}")
 
     # 2. Читаем комментарии из BroJS
+    # BroJS хранит фидбэк преподавателя в submission.grade.feedback,
+    # а не в верхнеуровневом поле comments (которое всегда пустой массив).
     try:
         raw = await mcp_call("task_get", {"taskId": task_id})
         data = json.loads(raw)
-        comments = data.get("comments") or data.get("feedback", "") or ""
+        submission = data.get("submission", data)
+        # Приоритет: submission.grade.feedback → data.feedback → data.comments
+        comments = (
+            (submission.get("grade") or {}).get("feedback", "")
+            or submission.get("feedback", "")
+            or data.get("feedback", "")
+            or data.get("comments", "")
+            or ""
+        )
         if isinstance(comments, list):
             comments = "\n".join(
                 c.get("text", c.get("content", str(c))) for c in comments if c
