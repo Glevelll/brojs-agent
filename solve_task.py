@@ -157,23 +157,38 @@ def _gh():
 async def _get_task_meta(task_id: str) -> dict:
     """Возвращает существующий repo_url и комментарии преподавателя (если есть).
 
-    Используется для определения: первая сдача или пересдача после отклонения.
+    Пересдача определяется по наличию репозитория на Gitea — независимо от того,
+    очистил ли BroJS поле answer при отклонении задания.
     """
+    repo_url = None
+    comments = ""
+
+    # 1. Проверяем репо напрямую на Gitea (надёжнее, чем BroJS answer)
+    repo_name = f"task-{task_id}"
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.get(
+                f"{GITEA_BASE_URL}/api/v1/repos/{GITEA_OWNER}/{repo_name}",
+                headers=_gh(),
+            )
+            if r.status_code == 200:
+                repo_url = f"{GITEA_BASE_URL}/{GITEA_OWNER}/{repo_name}"
+    except Exception as e:
+        print(f"  [meta] Не удалось проверить Gitea: {e}")
+
+    # 2. Читаем комментарии из BroJS
     try:
         raw = await mcp_call("task_get", {"taskId": task_id})
         data = json.loads(raw)
-        url = (data.get("answer") or {}).get("content", "")
-        repo_url = url if url.startswith(f"{GITEA_BASE_URL}/{GITEA_OWNER}/") else None
         comments = data.get("comments") or data.get("feedback", "") or ""
-        # comments может быть списком объектов
         if isinstance(comments, list):
             comments = "\n".join(
                 c.get("text", c.get("content", str(c))) for c in comments if c
             )
-        return {"repo_url": repo_url, "comments": str(comments).strip()}
     except Exception as e:
-        print(f"  [meta] Не удалось получить метаданные задания: {e}")
-        return {"repo_url": None, "comments": ""}
+        print(f"  [meta] Не удалось получить комментарии BroJS: {e}")
+
+    return {"repo_url": repo_url, "comments": str(comments).strip()}
 
 
 def gitea_create_repo(name: str) -> str:
