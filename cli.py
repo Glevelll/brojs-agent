@@ -83,9 +83,10 @@ async def cmd_status() -> None:
     print("[cli] Получаю список заданий...")
     journal   = load_journal_toolsets()
     tools     = {t.name: t for t in journal.tasks_submissions_tools}
-    tool      = tools.get("tasks_list")
+    tool      = tools.get("mcp__journal-bh-professor__tasks_list") \
+                or next((v for k, v in tools.items() if "tasks_list" in k), None)
     if not tool:
-        print("Ошибка: инструмент tasks_list не найден")
+        print(f"Ошибка: инструмент tasks_list не найден. Доступны: {list(tools.keys())}")
         return
 
     raw   = await tool.ainvoke({"courseId": "698b49da77cb6d4d2e43ce78"})

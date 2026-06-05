@@ -464,9 +464,15 @@ with tab_status:
 
                 async def _fetch():
                     j = load_journal_toolsets()
+                    # Инструменты имеют префикс mcp__journal-bh-professor__
                     tools = {t.name: t for t in j.tasks_submissions_tools}
-                    t = tools.get("tasks_list")
+                    full_name = "mcp__journal-bh-professor__tasks_list"
+                    t = tools.get(full_name)
                     if not t:
+                        # fallback: ищем по любому имени содержащему tasks_list
+                        t = next((v for k, v in tools.items() if "tasks_list" in k), None)
+                    if not t:
+                        st.warning(f"Инструмент tasks_list не найден. Доступны: {list(tools.keys())}")
                         return []
                     raw  = await t.ainvoke({"courseId": "698b49da77cb6d4d2e43ce78"})
                     text = next((x["text"] for x in raw if x.get("type") == "text"), str(raw)) if isinstance(raw, list) else str(raw)
