@@ -251,143 +251,162 @@ tab_chat, tab_pipeline, tab_status = st.tabs(["💬 Чат с агентом", "
 with tab_chat:
     st.caption("Общайся с агентом: задай вопрос, попроси решить задание или разобрать ситуацию.")
 
-    # История сообщений
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "chat_events" not in st.session_state:
-        st.session_state.chat_events = []
-    if "chat_thread_id" not in st.session_state:
-        st.session_state.chat_thread_id = f"ui-{int(time.time())}"
+    # Инициализация session state
+    for key, default in [
+        ("chat_history",   []),
+        ("chat_events",    []),
+        ("chat_thread_id", f"ui-{int(time.time())}"),
+        ("chat_running",   False),
+        ("_chat_last_event_t", time.time()),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
     # Показываем историю
     for msg in st.session_state.chat_history:
-        role = msg["role"]
-        text = msg["text"]
+        role, text = msg["role"], msg["text"]
         if role == "user":
             st.markdown(f'<div class="chat-user">👤 {text}</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="chat-agent">🤖 {text}</div>', unsafe_allow_html=True)
 
-    # Лог событий (раскрывающийся)
-    if st.session_state.chat_events:
-        with st.expander(f"🔍 Лог инструментов ({len(st.session_state.chat_events)} событий)", expanded=False):
-            html = "".join(_render_event(e) for e in st.session_state.chat_events[-80:])
-            st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
-                        unsafe_allow_html=True)
+    # ── АГЕНТ РАБОТАЕТ ──────────────────────────────────────────────────────
+    if st.session_state.chat_running:
+        thread: threading.Thread = st.session_state.get("_chat_thread")
+        evq: queue.Queue         = st.session_state.get("_chat_queue")
 
-    # Ввод
-    col_input, col_btn = st.columns([5, 1])
-    with col_input:
-        user_input = st.text_input(
-            "Сообщение",
-            placeholder='Например: "Реши задание 6a1864f7..." или "Какие задания у меня есть?"',
-            label_visibility="collapsed",
-            key="chat_input",
-        )
-    with col_btn:
-        send = st.button("Отправить", use_container_width=True, type="primary")
-
-    if send and user_input.strip():
-        msg_text = user_input.strip()
-        st.session_state.chat_history.append({"role": "user", "text": msg_text})
-        st.session_state.chat_events = []
-
-        # Строим историю сообщений для агента
-        lc_messages = []
-        for m in st.session_state.chat_history:
-            if m["role"] == "user":
-                lc_messages.append(HumanMessage(content=m["text"]))
-            else:
-                lc_messages.append(AIMessage(content=m["text"]))
-
-        config = {"configurable": {"thread_id": st.session_state.chat_thread_id}}
-        agent  = get_agent()
-
-        # Placeholders для обновления в реальном времени
-        events_ph = st.empty()
-        status_ph = st.empty()
-
-        evq: queue.Queue = queue.Queue()
-        cb  = AgentCallback(evq)
-        all_events: list[dict] = []
-        stop_flag = threading.Event()
-
-        thread = threading.Thread(
-            target=_run_agent_thread,
-            args=(agent, {"messages": lc_messages}, config, evq, cb, stop_flag),
-            daemon=True,
-        )
-        thread.start()
-
+        # Считываем новые события из очереди
+        new_events: list[dict] = []
         final_result = None
         fatal        = None
-        last_event_t = time.time()
 
-        stop_ph = st.empty()
-
-        while thread.is_alive() or not evq.empty():
-            # Кнопка "Стоп"
-            if stop_ph.button("🛑 Остановить", key=f"stop_{int(time.time()*1000)}"):
-                stop_flag.set()
-                fatal = "Остановлено пользователем"
-                break
-
-            changed = False
+        if evq:
             while not evq.empty():
                 ev = evq.get_nowait()
-                if ev["t"] in ("done", "fatal"):
-                    if ev["t"] == "done":
-                        final_result = ev["result"]
-                    else:
-                        fatal = ev["msg"]
+                if ev["t"] == "done":
+                    final_result = ev["result"]
+                elif ev["t"] == "fatal":
+                    fatal = ev["msg"]
                 else:
-                    all_events.append(ev)
-                    last_event_t = time.time()
-                    changed = True
+                    new_events.append(ev)
 
-            # Показываем "ожидание" если нет событий >15с
-            idle = time.time() - last_event_t
-            if idle > 15 and thread.is_alive():
-                status_ph.markdown(
-                    f'<div class="thinking" style="color:#f59e0b">'
-                    f'⏳ Агент работает... ({int(idle)}с без событий — '
-                    f'возможно ожидание rate limit)</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                status_ph.empty()
+        if new_events:
+            st.session_state.chat_events.extend(new_events)
+            st.session_state["_chat_last_event_t"] = time.time()
 
-            if changed and all_events:
-                html = "".join(_render_event(e) for e in all_events[-60:])
-                events_ph.markdown(
-                    f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
-                    f'max-height:250px;overflow-y:auto">{html}</div>',
-                    unsafe_allow_html=True,
-                )
-            time.sleep(0.3)
+        # Агент завершил работу?
+        agent_done = (final_result is not None or fatal is not None
+                      or (thread is not None and not thread.is_alive() and
+                          (evq is None or evq.empty())))
 
-        stop_ph.empty()
-        events_ph.empty()
-        status_ph.empty()
-        st.session_state.chat_events = all_events
+        if agent_done:
+            st.session_state.chat_running = False
+            if fatal:
+                st.session_state.chat_history.append(
+                    {"role": "agent", "text": f"⚠️ Ошибка: {fatal}"})
+            elif final_result:
+                msgs  = final_result.get("messages", [])
+                last  = msgs[-1] if msgs else None
+                reply = last.content if last and hasattr(last, "content") else "Готово."
+                st.session_state.chat_history.append({"role": "agent", "text": reply})
+            st.rerun()
 
-        if fatal:
-            st.session_state.chat_history.append({"role": "agent", "text": f"⚠️ Ошибка: {fatal}"})
-        elif final_result:
-            msgs = final_result.get("messages", [])
-            last = msgs[-1] if msgs else None
-            reply = last.content if last and hasattr(last, "content") else "Готово."
-            st.session_state.chat_history.append({"role": "agent", "text": reply})
+        # Показываем накопленные события
+        if st.session_state.chat_events:
+            html = "".join(_render_event(e) for e in st.session_state.chat_events[-80:])
+            st.markdown(
+                f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
+                f'max-height:260px;overflow-y:auto">{html}</div>',
+                unsafe_allow_html=True,
+            )
 
+        # Статус
+        idle = time.time() - st.session_state["_chat_last_event_t"]
+        if idle > 15:
+            st.markdown(
+                f'<div class="thinking" style="color:#f59e0b">'
+                f'⏳ Агент работает... ({int(idle)}с без событий — возможно rate limit)</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown('<div class="thinking">💭 Агент думает...</div>',
+                        unsafe_allow_html=True)
+
+        # Кнопка Стоп — работает, потому что НЕ внутри while-цикла
+        if st.button("🛑 Остановить", key="chat_stop_btn"):
+            stop_flag = st.session_state.get("_chat_stop_flag")
+            if stop_flag:
+                stop_flag.set()
+            st.session_state.chat_running = False
+            st.session_state.chat_history.append(
+                {"role": "agent", "text": "Остановлено пользователем."})
+            st.rerun()
+
+        # Следующая итерация опроса через 0.5с
+        time.sleep(0.5)
         st.rerun()
 
-    # Кнопка очистки
-    if st.session_state.chat_history:
-        if st.button("🗑 Очистить чат"):
-            st.session_state.chat_history = []
-            st.session_state.chat_events  = []
-            st.session_state.chat_thread_id = f"ui-{int(time.time())}"
-            st.rerun()
+    # ── ВВОД (агент не работает) ─────────────────────────────────────────────
+    else:
+        # Лог прошлого запроса
+        if st.session_state.chat_events:
+            with st.expander(
+                f"🔍 Лог инструментов ({len(st.session_state.chat_events)} событий)",
+                expanded=False,
+            ):
+                html = "".join(_render_event(e) for e in st.session_state.chat_events[-80:])
+                st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
+                            unsafe_allow_html=True)
+
+        col_input, col_btn = st.columns([5, 1])
+        with col_input:
+            user_input = st.text_input(
+                "Сообщение",
+                placeholder='Например: "Реши задание 6a1864f7..." или "Какие задания у меня есть?"',
+                label_visibility="collapsed",
+                key="chat_input",
+            )
+        with col_btn:
+            send = st.button("Отправить", use_container_width=True, type="primary")
+
+        if send and user_input.strip():
+            msg_text = user_input.strip()
+            st.session_state.chat_history.append({"role": "user", "text": msg_text})
+            st.session_state.chat_events = []
+
+            lc_messages = [
+                HumanMessage(content=m["text"]) if m["role"] == "user"
+                else AIMessage(content=m["text"])
+                for m in st.session_state.chat_history
+            ]
+            config    = {"configurable": {"thread_id": st.session_state.chat_thread_id}}
+            agent     = get_agent()
+            evq       = queue.Queue()
+            stop_flag = threading.Event()
+            cb        = AgentCallback(evq)
+
+            thread = threading.Thread(
+                target=_run_agent_thread,
+                args=(agent, {"messages": lc_messages}, config, evq, cb, stop_flag),
+                daemon=True,
+            )
+
+            # Сохраняем в session_state — переживут rerun
+            st.session_state["_chat_thread"]     = thread
+            st.session_state["_chat_queue"]      = evq
+            st.session_state["_chat_stop_flag"]  = stop_flag
+            st.session_state["_chat_last_event_t"] = time.time()
+            st.session_state.chat_running        = True
+
+            thread.start()
+            st.rerun()  # → переходим в ветку "АГЕНТ РАБОТАЕТ"
+
+        if st.session_state.chat_history:
+            if st.button("🗑 Очистить чат"):
+                st.session_state.chat_history   = []
+                st.session_state.chat_events    = []
+                st.session_state.chat_thread_id = f"ui-{int(time.time())}"
+                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -408,91 +427,139 @@ with tab_pipeline:
         st.write("")
         run_btn = st.button("▶ Запустить", type="primary", use_container_width=True)
 
-    if run_btn:
-        result_ph  = st.empty()
-        events_ph2 = st.empty()
-        agent      = get_agent()
+    # Инициализация pipeline session state
+    for key, default in [
+        ("pipe_running",       False),
+        ("pipe_events",        []),
+        ("_pipe_last_event_t", time.time()),
+        ("_pipe_task_id",      ""),
+        ("_pipe_result",       None),
+        ("_pipe_fatal",        None),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-        if task_id_input.strip():
-            # Одно задание
-            task_id = task_id_input.strip()
-            repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
-            prompt   = f"Реши задание taskId={task_id} курса 698b49da77cb6d4d2e43ce78"
-            config   = {"configurable": {"thread_id": f"pipe-{task_id}-{int(time.time())}"}}
-            messages = {"messages": [HumanMessage(content=prompt)]}
-        else:
-            result_ph.info("Pipeline для всех todo-заданий — используй раздел ниже")
-            st.stop()
+    if run_btn and task_id_input.strip():
+        task_id  = task_id_input.strip()
+        repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
+        prompt   = f"Реши задание taskId={task_id} курса 698b49da77cb6d4d2e43ce78"
+        config   = {"configurable": {"thread_id": f"pipe-{task_id}-{int(time.time())}"}}
+        messages = {"messages": [HumanMessage(content=prompt)]}
+        agent    = get_agent()
 
-        evq2: queue.Queue = queue.Queue()
-        cb2  = AgentCallback(evq2)
-        all_events2: list[dict] = []
+        evq2      = queue.Queue()
         stop_flag2 = threading.Event()
+        cb2        = AgentCallback(evq2)
 
         thread2 = threading.Thread(
             target=_run_agent_thread,
             args=(agent, messages, config, evq2, cb2, stop_flag2),
             daemon=True,
         )
+
+        st.session_state["_pipe_thread"]      = thread2
+        st.session_state["_pipe_queue"]       = evq2
+        st.session_state["_pipe_stop_flag"]   = stop_flag2
+        st.session_state["_pipe_task_id"]     = task_id
+        st.session_state["_pipe_last_event_t"] = time.time()
+        st.session_state.pipe_events          = []
+        st.session_state.pipe_running         = True
+        st.session_state["_pipe_result"]      = None
+        st.session_state["_pipe_fatal"]       = None
+
         thread2.start()
+        st.rerun()
 
-        final2       = None
-        fatal2       = None
-        last_event_t2 = time.time()
-        pipe_status_ph = st.empty()
-        pipe_stop_ph   = st.empty()
+    elif run_btn and not task_id_input.strip():
+        st.info("Введи Task ID выше или используй раздел «Запустить все todo-задания»")
 
-        with st.spinner(f"Агент решает {task_id[:8]}..."):
-            while thread2.is_alive() or not evq2.empty():
-                if pipe_stop_ph.button("🛑 Остановить", key=f"pipe_stop_{int(time.time()*1000)}"):
-                    stop_flag2.set()
-                    fatal2 = "Остановлено пользователем"
-                    break
+    # ── PIPELINE РАБОТАЕТ ────────────────────────────────────────────────────
+    if st.session_state.pipe_running:
+        thread2 = st.session_state.get("_pipe_thread")
+        evq2    = st.session_state.get("_pipe_queue")
+        task_id = st.session_state.get("_pipe_task_id", "")
 
-                while not evq2.empty():
-                    ev = evq2.get_nowait()
-                    if ev["t"] == "done":
-                        final2 = ev["result"]
-                    elif ev["t"] == "fatal":
-                        fatal2 = ev["msg"]
-                    else:
-                        all_events2.append(ev)
-                        last_event_t2 = time.time()
+        new_ev2: list[dict] = []
+        final2 = fatal2 = None
 
-                idle2 = time.time() - last_event_t2
-                if idle2 > 15 and thread2.is_alive():
-                    pipe_status_ph.markdown(
-                        f'<div class="thinking" style="color:#f59e0b">'
-                        f'⏳ Агент работает... ({int(idle2)}с — возможно rate limit)</div>',
-                        unsafe_allow_html=True,
-                    )
+        if evq2:
+            while not evq2.empty():
+                ev = evq2.get_nowait()
+                if ev["t"] == "done":
+                    final2 = ev["result"]
+                elif ev["t"] == "fatal":
+                    fatal2 = ev["msg"]
                 else:
-                    pipe_status_ph.empty()
+                    new_ev2.append(ev)
 
-                if all_events2:
-                    html = "".join(_render_event(e) for e in all_events2[-50:])
-                    events_ph2.markdown(
-                        f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
-                        f'max-height:300px;overflow-y:auto">{html}</div>',
-                        unsafe_allow_html=True,
-                    )
-                time.sleep(0.3)
+        if new_ev2:
+            st.session_state.pipe_events.extend(new_ev2)
+            st.session_state["_pipe_last_event_t"] = time.time()
 
-        pipe_stop_ph.empty()
-        pipe_status_ph.empty()
+        pipe_done = (final2 is not None or fatal2 is not None
+                     or (thread2 is not None and not thread2.is_alive()
+                         and (evq2 is None or evq2.empty())))
+
+        if pipe_done:
+            st.session_state.pipe_running    = False
+            st.session_state["_pipe_result"] = final2
+            st.session_state["_pipe_fatal"]  = fatal2
+            st.rerun()
+
+        # Живой лог
+        if st.session_state.pipe_events:
+            html = "".join(_render_event(e) for e in st.session_state.pipe_events[-60:])
+            st.markdown(
+                f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
+                f'max-height:300px;overflow-y:auto">{html}</div>',
+                unsafe_allow_html=True,
+            )
+
+        idle2 = time.time() - st.session_state["_pipe_last_event_t"]
+        if idle2 > 15:
+            st.markdown(
+                f'<div class="thinking" style="color:#f59e0b">'
+                f'⏳ Агент работает... ({int(idle2)}с — возможно rate limit)</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="thinking">💭 Решаю {task_id[:8]}...</div>',
+                        unsafe_allow_html=True)
+
+        if st.button("🛑 Остановить", key="pipe_stop_btn"):
+            sf = st.session_state.get("_pipe_stop_flag")
+            if sf:
+                sf.set()
+            st.session_state.pipe_running   = False
+            st.session_state["_pipe_fatal"] = "Остановлено пользователем"
+            st.rerun()
+
+        time.sleep(0.5)
+        st.rerun()
+
+    # ── РЕЗУЛЬТАТ ────────────────────────────────────────────────────────────
+    elif st.session_state.get("_pipe_fatal") or st.session_state.get("_pipe_result"):
+        task_id  = st.session_state.get("_pipe_task_id", "")
+        repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
+        fatal2   = st.session_state.get("_pipe_fatal")
+        final2   = st.session_state.get("_pipe_result")
 
         if fatal2:
-            result_ph.markdown(
-                f'<div class="status-err">❌ Ошибка: {fatal2[:300]}</div>',
-                unsafe_allow_html=True,
-            )
-        elif final2:
-            result_ph.markdown(
+            st.markdown(f'<div class="status-err">❌ {fatal2[:300]}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown(
                 f'<div class="status-ok">✅ Готово! '
-                f'<a href="{repo_url}" target="_blank" style="color:#4ade80">Открыть репозиторий</a>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+                f'<a href="{repo_url}" target="_blank" style="color:#4ade80">'
+                f'Открыть репозиторий ↗</a></div>',
+                unsafe_allow_html=True)
+
+        if st.session_state.pipe_events:
+            with st.expander(
+                f"🔍 Лог ({len(st.session_state.pipe_events)} событий)", expanded=False
+            ):
+                html = "".join(_render_event(e) for e in st.session_state.pipe_events[-80:])
+                st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
+                            unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Запустить все todo-задания")
