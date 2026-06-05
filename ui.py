@@ -426,28 +426,69 @@ with tab_pipeline:
     st.divider()
     st.subheader("Запустить все todo-задания")
     if st.button("⚡ Запустить pipeline для всех заданий", use_container_width=True):
-        pl = get_pipeline()
-        with st.spinner("Pipeline работает... (может занять несколько минут)"):
-            try:
-                res = asyncio.run(pl.ainvoke(
-                    {"tasks": [], "current_index": 0, "results": [], "errors": []}
-                ))
-                results = res.get("results", [])
-                errors  = res.get("errors", [])
+        pl       = get_pipeline()
+        evq_pl   = queue.Queue()
+        cb_pl    = AgentCallback(evq_pl)
+        all_pl_events: list[dict] = []
+        pl_result = None
+        pl_error  = None
 
-                md = [f"### Результат: {len(results)} заданий\n"]
-                for r in results:
-                    tid  = r.get("task_id", "")
-                    url  = f"https://git.brojs.ru/{GITEA_OWNER}/task-{tid}"
-                    icon = "✅" if r.get("status") == "ok" else "❌"
-                    md.append(f"- {icon} `{tid[:8]}...` — [{r.get('status','')}]({url})")
-                if errors:
-                    md.append(f"\n**Ошибки ({len(errors)}):**")
-                    for e in errors:
-                        md.append(f"- {e}")
-                st.markdown("\n".join(md))
-            except Exception as e:
-                st.error(str(e))
+        def _run_pipeline():
+            nonlocal pl_result, pl_error
+            async def _inner():
+                nonlocal pl_result, pl_error
+                try:
+                    pl_result = await pl.ainvoke(
+                        {"tasks": [], "current_index": 0, "results": [], "errors": []},
+                        {"callbacks": [cb_pl]},
+                    )
+                except Exception as e:
+                    pl_error = str(e)
+            asyncio.run(_inner())
+
+        t_pl = threading.Thread(target=_run_pipeline, daemon=True)
+        t_pl.start()
+
+        events_pl_ph = st.empty()
+        with st.spinner("Pipeline работает... (может занять несколько минут)"):
+            while t_pl.is_alive() or not evq_pl.empty():
+                while not evq_pl.empty():
+                    ev = evq_pl.get_nowait()
+                    if ev["t"] not in ("done", "fatal"):
+                        all_pl_events.append(ev)
+                if all_pl_events:
+                    html = "".join(_render_event(e) for e in all_pl_events[-60:])
+                    events_pl_ph.markdown(
+                        f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
+                        f'max-height:300px;overflow-y:auto">{html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                time.sleep(0.15)
+
+        events_pl_ph.empty()
+
+        if all_pl_events:
+            with st.expander(f"🔍 Лог pipeline ({len(all_pl_events)} событий)", expanded=False):
+                html = "".join(_render_event(e) for e in all_pl_events[-80:])
+                st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
+                            unsafe_allow_html=True)
+
+        if pl_error:
+            st.error(pl_error)
+        elif pl_result:
+            results = pl_result.get("results", [])
+            errors  = pl_result.get("errors", [])
+            md = [f"### Результат: {len(results)} заданий\n"]
+            for r in results:
+                tid  = r.get("task_id", "")
+                url  = f"https://git.brojs.ru/{GITEA_OWNER}/task-{tid}"
+                icon = "✅" if r.get("status") == "ok" else "❌"
+                md.append(f"- {icon} `{tid[:8]}...` — [{r.get('status','')}]({url})")
+            if errors:
+                md.append(f"\n**Ошибки ({len(errors)}):**")
+                for e in errors:
+                    md.append(f"- {e}")
+            st.markdown("\n".join(md))
 
 
 # ══════════════════════════════════════════════════════════════════════════

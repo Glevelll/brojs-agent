@@ -8,6 +8,7 @@ import re
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import START, StateGraph
 
 from src.agent.agent import homework_direct_agent, journal as _journal_toolsets, rework_agent
@@ -236,11 +237,16 @@ def _is_rate_limit(exc: Exception) -> bool:
     return "429" in msg or "rate" in msg.lower() or "rate_limit" in msg.lower()
 
 
-async def _invoke_with_retry(agent, messages, config):
-    """Вызывает агента с автоматическим retry при 429."""
+async def _invoke_with_retry(agent, messages, config, callbacks=None):
+    """Вызывает агента с автоматическим retry при 429.
+    callbacks — список LangChain callback-объектов (например AgentCallback из UI).
+    """
+    run_config = dict(config)
+    if callbacks:
+        run_config["callbacks"] = callbacks
     for attempt in range(1, RATE_LIMIT_RETRIES + 1):
         try:
-            return await agent.ainvoke(messages, config)
+            return await agent.ainvoke(messages, run_config)
         except Exception as e:
             if _is_rate_limit(e) and attempt < RATE_LIMIT_RETRIES:
                 wait = RATE_LIMIT_PAUSE * attempt
@@ -276,8 +282,8 @@ async def fetch_tasks(state: PipelineState) -> dict:
     return {"tasks": coding, "current_index": 0, "results": [], "errors": []}
 
 
-async def process_one_task(state: PipelineState) -> dict:
-    """Выполняет одно задание."""
+async def process_one_task(state: PipelineState, config: RunnableConfig | None = None) -> dict:
+    """Выполняет одно задание. config может содержать callbacks из UI."""
     if state["current_index"] >= len(state["tasks"]):
         return state
 
@@ -316,6 +322,9 @@ async def process_one_task(state: PipelineState) -> dict:
         )
         agent_to_use = homework_direct_agent
 
+    # Извлекаем callbacks из LangGraph config (переданы из UI)
+    callbacks = (config or {}).get("callbacks") or []
+
     try:
         print(f"[pipeline] Задание {task_id[:8]} — {'пересдача' if is_rework else 'первая сдача'}: "
               f"{task.get('title','')[:50]}")
@@ -324,6 +333,7 @@ async def process_one_task(state: PipelineState) -> dict:
             agent_to_use,
             {"messages": [HumanMessage(content=prompt)]},
             {"configurable": {"thread_id": f"pipeline-task-{task_id}"}},
+            callbacks=callbacks,
         )
         last    = (result.get("messages") or [{}])[-1]
         output  = getattr(last, "content", str(last))
@@ -343,6 +353,7 @@ async def process_one_task(state: PipelineState) -> dict:
                     agent_to_use,
                     {"messages": [HumanMessage(content=fix_msg)]},
                     {"configurable": {"thread_id": f"pipeline-task-{task_id}-retry-{retries}"}},
+                    callbacks=callbacks,
                 )
                 verification = await _verify_repo(repo_name)
 
