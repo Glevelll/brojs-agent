@@ -19,6 +19,7 @@ from src.agent.prompts import (
     rework_instructions,
 )
 from src.agent.subagents import subagent_specs_without_tools
+from src.agent.solve_tools import SOLVE_TOOLS
 from src.agent.tools import GIT_TOOLS, WEB_TOOLS
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ _composite_backend = CompositeBackend(
 # Наборы инструментов
 # ---------------------------------------------------------------------------
 
-_homework_tools = [*GIT_TOOLS, *GITEA_TOOLS, *WEB_TOOLS, *_journal_tools]
+_homework_tools = [*GIT_TOOLS, *GITEA_TOOLS, *WEB_TOOLS, *_journal_tools, *SOLVE_TOOLS]
 _web_tools      = WEB_TOOLS
 
 _subagent_tool_map = {
@@ -72,12 +73,13 @@ _gitea_names   = {t.name for t in GITEA_TOOLS}
 _journal_names = {t.name for t in _journal_tools}
 _git_names     = {t.name for t in GIT_TOOLS}
 _web_names     = {t.name for t in WEB_TOOLS}
+_solve_names   = {t.name for t in SOLVE_TOOLS}
 
 _main_tool_names = _BUILTIN | _gitea_names
 
 _subagent_tool_names: dict[str, set[str]] = {
     "web_search":                  _BUILTIN | _web_names,
-    "homework_doing":              _BUILTIN | _gitea_names | _journal_names | _git_names | _web_names,
+    "homework_doing":              _BUILTIN | _gitea_names | _journal_names | _git_names | _web_names | _solve_names,
     "journal_bh_tasks_submissions": _BUILTIN | _journal_names,
 }
 

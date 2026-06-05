@@ -172,9 +172,36 @@ def gitea_get_file(repo: str, path: str, owner: str = GITEA_OWNER) -> str:
         return f"Ошибка: {e}"
 
 
+@tool()
+def gitea_list_files(repo: str, owner: str = GITEA_OWNER) -> str:
+    """Список файлов в корне репозитория на git.brojs.ru.
+
+    Args:
+        repo: имя репозитория (например task-abc123)
+        owner: владелец репозитория (по умолчанию glevelll)
+    """
+    try:
+        result = _get(f"/api/v1/repos/{owner}/{repo}/contents")
+        files = [item["name"] for item in result if item.get("type") == "file"]
+        dirs  = [item["name"] for item in result if item.get("type") == "dir"]
+        parts = []
+        if files:
+            parts.append(f"Файлы: {', '.join(files)}")
+        if dirs:
+            parts.append(f"Папки: {', '.join(dirs)}")
+        return "\n".join(parts) if parts else f"Репозиторий {owner}/{repo} пуст"
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return f"Репозиторий {owner}/{repo} не найден (первая сдача)"
+        return f"Ошибка: {e.response.text}"
+    except Exception as e:
+        return f"Ошибка: {e}"
+
+
 # Список всех gitea-инструментов для удобного импорта
 GITEA_TOOLS = [
     gitea_list_repos,
+    gitea_list_files,
     gitea_create_repo,
     gitea_write_file,
     gitea_get_file,
