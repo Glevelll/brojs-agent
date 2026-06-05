@@ -147,14 +147,22 @@ class AgentCallback(BaseCallbackHandler):
 # Запуск агента в фоне
 # ---------------------------------------------------------------------------
 
-def _run_agent_thread(agent, messages, config, q: queue.Queue, cb: AgentCallback):
+def _run_agent_thread(
+    agent, messages, config, q: queue.Queue, cb: AgentCallback,
+    stop_flag: threading.Event,
+):
+    from src.agent.middlewares.retry_on_rate_limit import set_ui_event_queue
+    set_ui_event_queue(q)
     async def _inner():
         try:
             result = await agent.ainvoke(messages, {**config, "callbacks": [cb]})
             q.put({"t": "done", "result": result})
         except Exception as e:
             q.put({"t": "fatal", "msg": str(e)})
-    asyncio.run(_inner())
+        finally:
+            set_ui_event_queue(None)
+    if not stop_flag.is_set():
+        asyncio.run(_inner())
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +214,21 @@ def _render_event(ev: dict) -> str:
     if kind == "tool_error":
         msg = ev["msg"].replace("<", "&lt;")
         return f'<div class="tool-result" style="border-color:#ef4444;color:#f87171">⚠ {msg}</div>'
+
+    if kind == "rate_limit_wait":
+        name    = ev.get("name", "?")
+        pause   = ev.get("pause", 30)
+        attempt = ev.get("attempt", 1)
+        mx      = ev.get("max", 5)
+        return (f'<div class="thinking" style="color:#f59e0b">'
+                f'⏳ {ts} 429 rate limit — {name} · жду {pause}с '
+                f'(попытка {attempt}/{mx})</div>')
+
+    if kind == "rate_limit_retry":
+        name    = ev.get("name", "?")
+        attempt = ev.get("attempt", 2)
+        return (f'<div class="thinking" style="color:#86efac">'
+                f'🔄 {ts} повтор {name} (попытка {attempt})...</div>')
 
     if kind == "llm_end":
         preview = ev.get("preview", "").replace("<", "&lt;")[:100]
@@ -287,18 +310,28 @@ with tab_chat:
         evq: queue.Queue = queue.Queue()
         cb  = AgentCallback(evq)
         all_events: list[dict] = []
+        stop_flag = threading.Event()
 
         thread = threading.Thread(
             target=_run_agent_thread,
-            args=(agent, {"messages": lc_messages}, config, evq, cb),
+            args=(agent, {"messages": lc_messages}, config, evq, cb, stop_flag),
             daemon=True,
         )
         thread.start()
 
         final_result = None
         fatal        = None
+        last_event_t = time.time()
+
+        stop_ph = st.empty()
 
         while thread.is_alive() or not evq.empty():
+            # Кнопка "Стоп"
+            if stop_ph.button("🛑 Остановить", key=f"stop_{int(time.time()*1000)}"):
+                stop_flag.set()
+                fatal = "Остановлено пользователем"
+                break
+
             changed = False
             while not evq.empty():
                 ev = evq.get_nowait()
@@ -309,7 +342,20 @@ with tab_chat:
                         fatal = ev["msg"]
                 else:
                     all_events.append(ev)
+                    last_event_t = time.time()
                     changed = True
+
+            # Показываем "ожидание" если нет событий >15с
+            idle = time.time() - last_event_t
+            if idle > 15 and thread.is_alive():
+                status_ph.markdown(
+                    f'<div class="thinking" style="color:#f59e0b">'
+                    f'⏳ Агент работает... ({int(idle)}с без событий — '
+                    f'возможно ожидание rate limit)</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                status_ph.empty()
 
             if changed and all_events:
                 html = "".join(_render_event(e) for e in all_events[-60:])
@@ -318,9 +364,11 @@ with tab_chat:
                     f'max-height:250px;overflow-y:auto">{html}</div>',
                     unsafe_allow_html=True,
                 )
-            time.sleep(0.15)
+            time.sleep(0.3)
 
+        stop_ph.empty()
         events_ph.empty()
+        status_ph.empty()
         st.session_state.chat_events = all_events
 
         if fatal:
@@ -379,19 +427,28 @@ with tab_pipeline:
         evq2: queue.Queue = queue.Queue()
         cb2  = AgentCallback(evq2)
         all_events2: list[dict] = []
+        stop_flag2 = threading.Event()
 
         thread2 = threading.Thread(
             target=_run_agent_thread,
-            args=(agent, messages, config, evq2, cb2),
+            args=(agent, messages, config, evq2, cb2, stop_flag2),
             daemon=True,
         )
         thread2.start()
 
-        final2 = None
-        fatal2 = None
+        final2       = None
+        fatal2       = None
+        last_event_t2 = time.time()
+        pipe_status_ph = st.empty()
+        pipe_stop_ph   = st.empty()
 
         with st.spinner(f"Агент решает {task_id[:8]}..."):
             while thread2.is_alive() or not evq2.empty():
+                if pipe_stop_ph.button("🛑 Остановить", key=f"pipe_stop_{int(time.time()*1000)}"):
+                    stop_flag2.set()
+                    fatal2 = "Остановлено пользователем"
+                    break
+
                 while not evq2.empty():
                     ev = evq2.get_nowait()
                     if ev["t"] == "done":
@@ -400,6 +457,17 @@ with tab_pipeline:
                         fatal2 = ev["msg"]
                     else:
                         all_events2.append(ev)
+                        last_event_t2 = time.time()
+
+                idle2 = time.time() - last_event_t2
+                if idle2 > 15 and thread2.is_alive():
+                    pipe_status_ph.markdown(
+                        f'<div class="thinking" style="color:#f59e0b">'
+                        f'⏳ Агент работает... ({int(idle2)}с — возможно rate limit)</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    pipe_status_ph.empty()
 
                 if all_events2:
                     html = "".join(_render_event(e) for e in all_events2[-50:])
@@ -408,7 +476,10 @@ with tab_pipeline:
                         f'max-height:300px;overflow-y:auto">{html}</div>',
                         unsafe_allow_html=True,
                     )
-                time.sleep(0.15)
+                time.sleep(0.3)
+
+        pipe_stop_ph.empty()
+        pipe_status_ph.empty()
 
         if fatal2:
             result_ph.markdown(
