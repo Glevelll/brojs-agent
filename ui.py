@@ -1,7 +1,7 @@
 """
 Streamlit UI для brojs-agent.
 
-Запуск: streamlit run ui.py
+Запуск: python -m streamlit run ui.py
 """
 import asyncio
 import json
@@ -68,12 +68,16 @@ st.markdown("""
 .thinking {
     color: #64748b; font-style: italic; font-size: .82em; padding: 4px 0;
 }
-.status-ok   { background:#052e16; border:1px solid #22c55e; color:#4ade80; padding:10px 16px; border-radius:8px; }
-.status-warn { background:#1c1917; border:1px solid #f59e0b; color:#fbbf24; padding:10px 16px; border-radius:8px; }
-.status-err  { background:#1c0a0a; border:1px solid #ef4444; color:#f87171; padding:10px 16px; border-radius:8px; }
-
-.chat-user { background:#1e3a5f; border-radius:12px 12px 2px 12px; padding:10px 14px; margin:6px 0; }
-.chat-agent { background:#1a1a2e; border-radius:12px 12px 12px 2px; padding:10px 14px; margin:6px 0; }
+.status-ok   { background:#052e16; border:1px solid #22c55e; color:#4ade80;
+               padding:10px 16px; border-radius:8px; }
+.status-warn { background:#1c1917; border:1px solid #f59e0b; color:#fbbf24;
+               padding:10px 16px; border-radius:8px; }
+.status-err  { background:#1c0a0a; border:1px solid #ef4444; color:#f87171;
+               padding:10px 16px; border-radius:8px; }
+.chat-user  { background:#1e3a5f; border-radius:12px 12px 2px 12px;
+              padding:10px 14px; margin:6px 0; }
+.chat-agent { background:#1a1a2e; border-radius:12px 12px 12px 2px;
+              padding:10px 14px; margin:6px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,34 +93,39 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Кэш агента
+# Кэш агента — загружается один раз при первом обращении
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner="Инициализация агента (~30с)...")
+@st.cache_resource(show_spinner="⏳ Инициализация агента (подключение к MCP)...")
 def get_agent():
     from src.agent.agent import homework_direct_agent
     return homework_direct_agent
 
 
-@st.cache_resource(show_spinner="Загрузка pipeline...")
+@st.cache_resource(show_spinner="⏳ Загрузка pipeline...")
 def get_pipeline():
     from src.agent.graph.pipeline import pipeline
     return pipeline
 
 # ---------------------------------------------------------------------------
-# Callback — перехватывает события агента и шлёт в очередь
+# Сборщик событий агента (синхронный — не нужна очередь)
 # ---------------------------------------------------------------------------
 
-_SOLVE_TOOLS = {"validate_teacher_comment", "generate_code_solution"}
+_SOLVE_TOOLS    = {"validate_teacher_comment", "generate_code_solution"}
 _JOURNAL_PREFIX = "mcp__journal-bh-professor__"
 
 
-class AgentCallback(BaseCallbackHandler):
-    def __init__(self, q: queue.Queue):
-        self.q = q
+class AgentEventCollector(BaseCallbackHandler):
+    """Накапливает события агента в список во время синхронного вызова."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
 
     def _ts(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
+
+    def _add(self, ev: dict) -> None:
+        self.events.append(ev)
 
     def on_tool_start(self, serialized, input_str, **kwargs):
         name = serialized.get("name", "?")
@@ -124,49 +133,78 @@ class AgentCallback(BaseCallbackHandler):
             args = json.loads(str(input_str)) if isinstance(input_str, str) else input_str
         except Exception:
             args = {}
-        self.q.put({"t": "tool_start", "ts": self._ts(), "name": name, "args": args})
+        self._add({"t": "tool_start", "ts": self._ts(), "name": name, "args": args})
 
     def on_tool_end(self, output, **kwargs):
-        self.q.put({"t": "tool_end", "ts": self._ts(), "output": str(output)[:300]})
+        self._add({"t": "tool_end", "ts": self._ts(), "output": str(output)[:300]})
 
     def on_tool_error(self, error, **kwargs):
-        self.q.put({"t": "tool_error", "ts": self._ts(), "msg": str(error)[:200]})
+        self._add({"t": "tool_error", "ts": self._ts(), "msg": str(error)[:200]})
 
     def on_llm_start(self, *a, **kw):
-        self.q.put({"t": "thinking", "ts": self._ts()})
+        self._add({"t": "thinking", "ts": self._ts()})
 
     def on_llm_end(self, response, **kwargs):
         try:
             text = response.generations[0][0].text[:120]
-            self.q.put({"t": "llm_end", "ts": self._ts(), "preview": text})
+            self._add({"t": "llm_end", "ts": self._ts(), "preview": text})
         except Exception:
             pass
 
 
 # ---------------------------------------------------------------------------
-# Запуск агента в фоне
+# Запуск агента — блокирующий вызов в отдельном потоке
+# (избегаем конфликтов с event loop Streamlit)
 # ---------------------------------------------------------------------------
 
-def _run_agent_thread(
-    agent, messages, config, q: queue.Queue, cb: AgentCallback,
-    stop_flag: threading.Event,
-):
+def _invoke_agent(
+    agent, messages: dict, config: dict
+) -> tuple[dict | None, list[dict], str | None]:
+    """
+    Запускает агента синхронно. Блокирует поток до завершения.
+    Возвращает (result, events, error_message).
+    """
     from src.agent.middlewares.retry_on_rate_limit import set_ui_event_queue
-    set_ui_event_queue(q)
-    async def _inner():
-        try:
-            result = await agent.ainvoke(messages, {**config, "callbacks": [cb]})
-            q.put({"t": "done", "result": result})
-        except Exception as e:
-            q.put({"t": "fatal", "msg": str(e)})
-        finally:
-            set_ui_event_queue(None)
-    if not stop_flag.is_set():
+
+    collector  = AgentEventCollector()
+    # Очередь для rate-limit событий из middleware
+    rl_queue: queue.Queue = queue.Queue()
+    set_ui_event_queue(rl_queue)
+
+    result: dict | None = None
+    error:  str  | None = None
+
+    def _thread_fn() -> None:
+        nonlocal result, error
+
+        async def _inner() -> None:
+            nonlocal result, error
+            try:
+                r = await agent.ainvoke(messages, {**config, "callbacks": [collector]})
+                result = r
+            except Exception as e:
+                error = str(e)
+
         asyncio.run(_inner())
 
+    t = threading.Thread(target=_thread_fn, daemon=True)
+    t.start()
+    t.join()           # ждём завершения (UI показывает spinner)
+
+    set_ui_event_queue(None)
+
+    # Переносим rate-limit события в список collector'а
+    while not rl_queue.empty():
+        try:
+            collector.events.append(rl_queue.get_nowait())
+        except Exception:
+            break
+
+    return result, collector.events, error
+
 
 # ---------------------------------------------------------------------------
-# Рендер одного события в лог
+# Рендер одного события в HTML
 # ---------------------------------------------------------------------------
 
 def _render_event(ev: dict) -> str:
@@ -177,28 +215,19 @@ def _render_event(ev: dict) -> str:
         return f'<div class="thinking">💭 {ts} модель думает...</div>'
 
     if kind == "tool_start":
-        name = ev["name"]
-        args = ev.get("args", {})
+        name  = ev["name"]
+        args  = ev.get("args", {})
         short = name.replace(_JOURNAL_PREFIX, "mcp::")
-        # Определяем тип инструмента
-        if name in _SOLVE_TOOLS:
-            cls  = "tool-subagent"
-            icon = "🧠"
-            label = f"[субагент] {short}"
-        elif "gitea" in name:
-            cls  = "tool-call"
-            icon = "📦"
-            label = short
-        elif "mcp::" in short or "journal" in name:
-            cls  = "tool-call"
-            icon = "📡"
-            label = short
-        else:
-            cls  = "tool-call"
-            icon = "🔧"
-            label = short
 
-        # Показываем ключевые аргументы
+        if name in _SOLVE_TOOLS:
+            cls, icon, label = "tool-subagent", "🧠", f"[субагент] {short}"
+        elif "gitea" in name:
+            cls, icon, label = "tool-call", "📦", short
+        elif "mcp::" in short or "journal" in name:
+            cls, icon, label = "tool-call", "📡", short
+        else:
+            cls, icon, label = "tool-call", "🔧", short
+
         hint = ""
         for key in ("taskId", "path", "repo", "repo_name", "name"):
             if key in args:
@@ -216,12 +245,12 @@ def _render_event(ev: dict) -> str:
         return f'<div class="tool-result" style="border-color:#ef4444;color:#f87171">⚠ {msg}</div>'
 
     if kind == "rate_limit_wait":
-        name    = ev.get("name", "?")
-        pause   = ev.get("pause", 30)
-        attempt = ev.get("attempt", 1)
-        mx      = ev.get("max", 5)
+        name, pause, attempt, mx = (
+            ev.get("name", "?"), ev.get("pause", 30),
+            ev.get("attempt", 1), ev.get("max", 5),
+        )
         return (f'<div class="thinking" style="color:#f59e0b">'
-                f'⏳ {ts} 429 rate limit — {name} · жду {pause}с '
+                f'⏳ {ts} 429 rate limit — {name} · ждал {pause}с '
                 f'(попытка {attempt}/{mx})</div>')
 
     if kind == "rate_limit_retry":
@@ -237,11 +266,22 @@ def _render_event(ev: dict) -> str:
     return ""
 
 
+def _show_events(events: list[dict], expanded: bool = False) -> None:
+    if not events:
+        return
+    with st.expander(f"🔍 Лог инструментов ({len(events)} событий)", expanded=expanded):
+        html = "".join(_render_event(e) for e in events[-80:])
+        st.markdown(f'<div style="max-height:320px;overflow-y:auto">{html}</div>',
+                    unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Вкладки
 # ---------------------------------------------------------------------------
 
-tab_chat, tab_pipeline, tab_status = st.tabs(["💬 Чат с агентом", "⚡ Pipeline", "📊 Статус заданий"])
+tab_chat, tab_pipeline, tab_status = st.tabs(
+    ["💬 Чат с агентом", "⚡ Pipeline", "📊 Статус заданий"]
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -249,164 +289,87 @@ tab_chat, tab_pipeline, tab_status = st.tabs(["💬 Чат с агентом", "
 # ══════════════════════════════════════════════════════════════════════════
 
 with tab_chat:
-    st.caption("Общайся с агентом: задай вопрос, попроси решить задание или разобрать ситуацию.")
+    st.caption("Пиши агенту напрямую. Пока он работает — показывается spinner.")
 
-    # Инициализация session state
-    for key, default in [
-        ("chat_history",   []),
-        ("chat_events",    []),
-        ("chat_thread_id", f"ui-{int(time.time())}"),
-        ("chat_running",   False),
-        ("_chat_last_event_t", time.time()),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "chat_events" not in st.session_state:
+        st.session_state.chat_events = []
+    if "chat_thread_id" not in st.session_state:
+        st.session_state.chat_thread_id = f"ui-{int(time.time())}"
 
-    # Показываем историю
+    # История сообщений
     for msg in st.session_state.chat_history:
         role, text = msg["role"], msg["text"]
         if role == "user":
-            st.markdown(f'<div class="chat-user">👤 {text}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="chat-user">👤 {text}</div>',
+                        unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="chat-agent">🤖 {text}</div>', unsafe_allow_html=True)
-
-    # ── АГЕНТ РАБОТАЕТ ──────────────────────────────────────────────────────
-    if st.session_state.chat_running:
-        thread: threading.Thread = st.session_state.get("_chat_thread")
-        evq: queue.Queue         = st.session_state.get("_chat_queue")
-
-        # Считываем новые события из очереди
-        new_events: list[dict] = []
-        final_result = None
-        fatal        = None
-
-        if evq:
-            while not evq.empty():
-                ev = evq.get_nowait()
-                if ev["t"] == "done":
-                    final_result = ev["result"]
-                elif ev["t"] == "fatal":
-                    fatal = ev["msg"]
-                else:
-                    new_events.append(ev)
-
-        if new_events:
-            st.session_state.chat_events.extend(new_events)
-            st.session_state["_chat_last_event_t"] = time.time()
-
-        # Агент завершил работу?
-        agent_done = (final_result is not None or fatal is not None
-                      or (thread is not None and not thread.is_alive() and
-                          (evq is None or evq.empty())))
-
-        if agent_done:
-            st.session_state.chat_running = False
-            if fatal:
-                st.session_state.chat_history.append(
-                    {"role": "agent", "text": f"⚠️ Ошибка: {fatal}"})
-            elif final_result:
-                msgs  = final_result.get("messages", [])
-                last  = msgs[-1] if msgs else None
-                reply = last.content if last and hasattr(last, "content") else "Готово."
-                st.session_state.chat_history.append({"role": "agent", "text": reply})
-            st.rerun()
-
-        # Показываем накопленные события
-        if st.session_state.chat_events:
-            html = "".join(_render_event(e) for e in st.session_state.chat_events[-80:])
-            st.markdown(
-                f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
-                f'max-height:260px;overflow-y:auto">{html}</div>',
-                unsafe_allow_html=True,
-            )
-
-        # Статус
-        idle = time.time() - st.session_state["_chat_last_event_t"]
-        if idle > 15:
-            st.markdown(
-                f'<div class="thinking" style="color:#f59e0b">'
-                f'⏳ Агент работает... ({int(idle)}с без событий — возможно rate limit)</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown('<div class="thinking">💭 Агент думает...</div>',
+            st.markdown(f'<div class="chat-agent">🤖 {text}</div>',
                         unsafe_allow_html=True)
 
-        # Кнопка Стоп — работает, потому что НЕ внутри while-цикла
-        if st.button("🛑 Остановить", key="chat_stop_btn"):
-            stop_flag = st.session_state.get("_chat_stop_flag")
-            if stop_flag:
-                stop_flag.set()
-            st.session_state.chat_running = False
-            st.session_state.chat_history.append(
-                {"role": "agent", "text": "Остановлено пользователем."})
-            st.rerun()
+    # Лог предыдущего запроса
+    _show_events(st.session_state.chat_events)
 
-        # Следующая итерация опроса через 0.5с
-        time.sleep(0.5)
+    # Поле ввода
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        user_input = st.text_input(
+            "Сообщение",
+            placeholder='"Реши задание 6a1864f7..." или "Какие задания у меня есть?"',
+            label_visibility="collapsed",
+            key="chat_input",
+        )
+    with col_btn:
+        send = st.button("Отправить", use_container_width=True, type="primary")
+
+    if send and user_input.strip():
+        msg_text = user_input.strip()
+        st.session_state.chat_history.append({"role": "user", "text": msg_text})
+        st.session_state.chat_events = []
+
+        lc_messages = [
+            HumanMessage(content=m["text"]) if m["role"] == "user"
+            else AIMessage(content=m["text"])
+            for m in st.session_state.chat_history
+        ]
+        config = {"configurable": {"thread_id": st.session_state.chat_thread_id}}
+
+        try:
+            agent = get_agent()
+        except Exception as e:
+            st.error(f"Ошибка инициализации агента: {e}")
+            st.stop()
+
+        with st.spinner("🤖 Агент работает... (это может занять несколько минут)"):
+            result, events, error = _invoke_agent(
+                agent, {"messages": lc_messages}, config
+            )
+
+        st.session_state.chat_events = events
+
+        if error:
+            st.session_state.chat_history.append(
+                {"role": "agent", "text": f"⚠️ Ошибка: {error}"}
+            )
+        elif result:
+            msgs  = result.get("messages", [])
+            last  = msgs[-1] if msgs else None
+            reply = last.content if last and hasattr(last, "content") else "Готово."
+            st.session_state.chat_history.append({"role": "agent", "text": reply})
+        else:
+            st.session_state.chat_history.append(
+                {"role": "agent", "text": "Агент завершил работу без ответа."}
+            )
+
         st.rerun()
 
-    # ── ВВОД (агент не работает) ─────────────────────────────────────────────
-    else:
-        # Лог прошлого запроса
-        if st.session_state.chat_events:
-            with st.expander(
-                f"🔍 Лог инструментов ({len(st.session_state.chat_events)} событий)",
-                expanded=False,
-            ):
-                html = "".join(_render_event(e) for e in st.session_state.chat_events[-80:])
-                st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
-                            unsafe_allow_html=True)
-
-        col_input, col_btn = st.columns([5, 1])
-        with col_input:
-            user_input = st.text_input(
-                "Сообщение",
-                placeholder='Например: "Реши задание 6a1864f7..." или "Какие задания у меня есть?"',
-                label_visibility="collapsed",
-                key="chat_input",
-            )
-        with col_btn:
-            send = st.button("Отправить", use_container_width=True, type="primary")
-
-        if send and user_input.strip():
-            msg_text = user_input.strip()
-            st.session_state.chat_history.append({"role": "user", "text": msg_text})
-            st.session_state.chat_events = []
-
-            lc_messages = [
-                HumanMessage(content=m["text"]) if m["role"] == "user"
-                else AIMessage(content=m["text"])
-                for m in st.session_state.chat_history
-            ]
-            config    = {"configurable": {"thread_id": st.session_state.chat_thread_id}}
-            agent     = get_agent()
-            evq       = queue.Queue()
-            stop_flag = threading.Event()
-            cb        = AgentCallback(evq)
-
-            thread = threading.Thread(
-                target=_run_agent_thread,
-                args=(agent, {"messages": lc_messages}, config, evq, cb, stop_flag),
-                daemon=True,
-            )
-
-            # Сохраняем в session_state — переживут rerun
-            st.session_state["_chat_thread"]     = thread
-            st.session_state["_chat_queue"]      = evq
-            st.session_state["_chat_stop_flag"]  = stop_flag
-            st.session_state["_chat_last_event_t"] = time.time()
-            st.session_state.chat_running        = True
-
-            thread.start()
-            st.rerun()  # → переходим в ветку "АГЕНТ РАБОТАЕТ"
-
-        if st.session_state.chat_history:
-            if st.button("🗑 Очистить чат"):
-                st.session_state.chat_history   = []
-                st.session_state.chat_events    = []
-                st.session_state.chat_thread_id = f"ui-{int(time.time())}"
-                st.rerun()
+    if st.session_state.chat_history:
+        if st.button("🗑 Очистить чат"):
+            st.session_state.chat_history   = []
+            st.session_state.chat_events    = []
+            st.session_state.chat_thread_id = f"ui-{int(time.time())}"
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -414,12 +377,17 @@ with tab_chat:
 # ══════════════════════════════════════════════════════════════════════════
 
 with tab_pipeline:
-    st.caption("Автоматически решает все todo-задания курса по очереди.")
+    st.caption("Запусти конкретное задание по ID или все todo-задания сразу.")
+
+    if "pipe_events" not in st.session_state:
+        st.session_state.pipe_events = []
+    if "pipe_result_text" not in st.session_state:
+        st.session_state.pipe_result_text = ""
 
     col1, col2 = st.columns([3, 1])
     with col1:
         task_id_input = st.text_input(
-            "Task ID (оставь пустым — решить все todo)",
+            "Task ID",
             placeholder="6a1864f7fd30e81cf3146d65",
             label_visibility="visible",
         )
@@ -427,139 +395,48 @@ with tab_pipeline:
         st.write("")
         run_btn = st.button("▶ Запустить", type="primary", use_container_width=True)
 
-    # Инициализация pipeline session state
-    for key, default in [
-        ("pipe_running",       False),
-        ("pipe_events",        []),
-        ("_pipe_last_event_t", time.time()),
-        ("_pipe_task_id",      ""),
-        ("_pipe_result",       None),
-        ("_pipe_fatal",        None),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+    # Показываем результат предыдущего запуска
+    if st.session_state.pipe_result_text:
+        st.markdown(st.session_state.pipe_result_text, unsafe_allow_html=True)
 
-    if run_btn and task_id_input.strip():
-        task_id  = task_id_input.strip()
-        repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
-        prompt   = f"Реши задание taskId={task_id} курса 698b49da77cb6d4d2e43ce78"
-        config   = {"configurable": {"thread_id": f"pipe-{task_id}-{int(time.time())}"}}
-        messages = {"messages": [HumanMessage(content=prompt)]}
-        agent    = get_agent()
+    _show_events(st.session_state.pipe_events)
 
-        evq2      = queue.Queue()
-        stop_flag2 = threading.Event()
-        cb2        = AgentCallback(evq2)
-
-        thread2 = threading.Thread(
-            target=_run_agent_thread,
-            args=(agent, messages, config, evq2, cb2, stop_flag2),
-            daemon=True,
-        )
-
-        st.session_state["_pipe_thread"]      = thread2
-        st.session_state["_pipe_queue"]       = evq2
-        st.session_state["_pipe_stop_flag"]   = stop_flag2
-        st.session_state["_pipe_task_id"]     = task_id
-        st.session_state["_pipe_last_event_t"] = time.time()
-        st.session_state.pipe_events          = []
-        st.session_state.pipe_running         = True
-        st.session_state["_pipe_result"]      = None
-        st.session_state["_pipe_fatal"]       = None
-
-        thread2.start()
-        st.rerun()
-
-    elif run_btn and not task_id_input.strip():
-        st.info("Введи Task ID выше или используй раздел «Запустить все todo-задания»")
-
-    # ── PIPELINE РАБОТАЕТ ────────────────────────────────────────────────────
-    if st.session_state.pipe_running:
-        thread2 = st.session_state.get("_pipe_thread")
-        evq2    = st.session_state.get("_pipe_queue")
-        task_id = st.session_state.get("_pipe_task_id", "")
-
-        new_ev2: list[dict] = []
-        final2 = fatal2 = None
-
-        if evq2:
-            while not evq2.empty():
-                ev = evq2.get_nowait()
-                if ev["t"] == "done":
-                    final2 = ev["result"]
-                elif ev["t"] == "fatal":
-                    fatal2 = ev["msg"]
-                else:
-                    new_ev2.append(ev)
-
-        if new_ev2:
-            st.session_state.pipe_events.extend(new_ev2)
-            st.session_state["_pipe_last_event_t"] = time.time()
-
-        pipe_done = (final2 is not None or fatal2 is not None
-                     or (thread2 is not None and not thread2.is_alive()
-                         and (evq2 is None or evq2.empty())))
-
-        if pipe_done:
-            st.session_state.pipe_running    = False
-            st.session_state["_pipe_result"] = final2
-            st.session_state["_pipe_fatal"]  = fatal2
-            st.rerun()
-
-        # Живой лог
-        if st.session_state.pipe_events:
-            html = "".join(_render_event(e) for e in st.session_state.pipe_events[-60:])
-            st.markdown(
-                f'<div style="background:#0b0f1a;border-radius:8px;padding:10px;'
-                f'max-height:300px;overflow-y:auto">{html}</div>',
-                unsafe_allow_html=True,
-            )
-
-        idle2 = time.time() - st.session_state["_pipe_last_event_t"]
-        if idle2 > 15:
-            st.markdown(
-                f'<div class="thinking" style="color:#f59e0b">'
-                f'⏳ Агент работает... ({int(idle2)}с — возможно rate limit)</div>',
-                unsafe_allow_html=True)
+    if run_btn:
+        if not task_id_input.strip():
+            st.warning("Введи Task ID")
         else:
-            st.markdown(f'<div class="thinking">💭 Решаю {task_id[:8]}...</div>',
-                        unsafe_allow_html=True)
+            task_id  = task_id_input.strip()
+            repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
+            prompt   = f"Реши задание taskId={task_id} курса 698b49da77cb6d4d2e43ce78"
+            config   = {"configurable": {"thread_id": f"pipe-{task_id}-{int(time.time())}"}}
+            messages = {"messages": [HumanMessage(content=prompt)]}
 
-        if st.button("🛑 Остановить", key="pipe_stop_btn"):
-            sf = st.session_state.get("_pipe_stop_flag")
-            if sf:
-                sf.set()
-            st.session_state.pipe_running   = False
-            st.session_state["_pipe_fatal"] = "Остановлено пользователем"
+            st.session_state.pipe_events      = []
+            st.session_state.pipe_result_text = ""
+
+            try:
+                agent = get_agent()
+            except Exception as e:
+                st.error(f"Ошибка инициализации агента: {e}")
+                st.stop()
+
+            with st.spinner(f"🤖 Решаю задание {task_id[:8]}..."):
+                result, events, error = _invoke_agent(agent, messages, config)
+
+            st.session_state.pipe_events = events
+
+            if error:
+                st.session_state.pipe_result_text = (
+                    f'<div class="status-err">❌ Ошибка: {error[:400]}</div>'
+                )
+            else:
+                st.session_state.pipe_result_text = (
+                    f'<div class="status-ok">✅ Готово! '
+                    f'<a href="{repo_url}" target="_blank" style="color:#4ade80">'
+                    f'Открыть репозиторий ↗</a></div>'
+                )
+
             st.rerun()
-
-        time.sleep(0.5)
-        st.rerun()
-
-    # ── РЕЗУЛЬТАТ ────────────────────────────────────────────────────────────
-    elif st.session_state.get("_pipe_fatal") or st.session_state.get("_pipe_result"):
-        task_id  = st.session_state.get("_pipe_task_id", "")
-        repo_url = f"https://git.brojs.ru/{GITEA_OWNER}/task-{task_id}"
-        fatal2   = st.session_state.get("_pipe_fatal")
-        final2   = st.session_state.get("_pipe_result")
-
-        if fatal2:
-            st.markdown(f'<div class="status-err">❌ {fatal2[:300]}</div>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f'<div class="status-ok">✅ Готово! '
-                f'<a href="{repo_url}" target="_blank" style="color:#4ade80">'
-                f'Открыть репозиторий ↗</a></div>',
-                unsafe_allow_html=True)
-
-        if st.session_state.pipe_events:
-            with st.expander(
-                f"🔍 Лог ({len(st.session_state.pipe_events)} событий)", expanded=False
-            ):
-                html = "".join(_render_event(e) for e in st.session_state.pipe_events[-80:])
-                st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
-                            unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Запустить все todo-задания")
@@ -601,19 +478,20 @@ with tab_status:
                 from src.agent.mcp_client import load_journal_toolsets
 
                 async def _fetch():
-                    j = load_journal_toolsets()
-                    # Инструменты имеют префикс mcp__journal-bh-professor__
+                    j     = load_journal_toolsets()
                     tools = {t.name: t for t in j.tasks_submissions_tools}
                     full_name = "mcp__journal-bh-professor__tasks_list"
-                    t = tools.get(full_name)
+                    t = tools.get(full_name) or next(
+                        (v for k, v in tools.items() if "tasks_list" in k), None
+                    )
                     if not t:
-                        # fallback: ищем по любому имени содержащему tasks_list
-                        t = next((v for k, v in tools.items() if "tasks_list" in k), None)
-                    if not t:
-                        st.warning(f"Инструмент tasks_list не найден. Доступны: {list(tools.keys())}")
+                        st.warning(f"tasks_list не найден. Доступны: {list(tools.keys())}")
                         return []
                     raw  = await t.ainvoke({"courseId": "698b49da77cb6d4d2e43ce78"})
-                    text = next((x["text"] for x in raw if x.get("type") == "text"), str(raw)) if isinstance(raw, list) else str(raw)
+                    text = (
+                        next((x["text"] for x in raw if x.get("type") == "text"), str(raw))
+                        if isinstance(raw, list) else str(raw)
+                    )
                     data = json.loads(text)
                     return data.get("tasks", data) if isinstance(data, dict) else data
 
@@ -643,7 +521,7 @@ with tab_status:
             title  = t.get("title", t.get("name", ""))
             counts[status] = counts.get(status, 0) + 1
             rows.append({
-                "": STATUS_EMOJI.get(status, "❓"),
+                "":         STATUS_EMOJI.get(status, "❓"),
                 "Статус":   status,
                 "ID":       tid[:12] + "...",
                 "Название": title,
@@ -655,6 +533,6 @@ with tab_status:
         st.divider()
         cols = st.columns(len(counts))
         for col, (s, n) in zip(cols, counts.items()):
-            col.metric(f"{STATUS_EMOJI.get(s,'❓')} {s}", n)
+            col.metric(f"{STATUS_EMOJI.get(s, '❓')} {s}", n)
     else:
         st.info("Нажми «Обновить статусы» чтобы загрузить данные.")
