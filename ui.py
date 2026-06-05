@@ -430,20 +430,17 @@ with tab_pipeline:
         evq_pl   = queue.Queue()
         cb_pl    = AgentCallback(evq_pl)
         all_pl_events: list[dict] = []
-        pl_result = None
-        pl_error  = None
+        _pl_state = {"result": None, "error": None}
 
         def _run_pipeline():
-            nonlocal pl_result, pl_error
             async def _inner():
-                nonlocal pl_result, pl_error
                 try:
-                    pl_result = await pl.ainvoke(
+                    _pl_state["result"] = await pl.ainvoke(
                         {"tasks": [], "current_index": 0, "results": [], "errors": []},
                         {"callbacks": [cb_pl]},
                     )
                 except Exception as e:
-                    pl_error = str(e)
+                    _pl_state["error"] = str(e)
             asyncio.run(_inner())
 
         t_pl = threading.Thread(target=_run_pipeline, daemon=True)
@@ -473,11 +470,11 @@ with tab_pipeline:
                 st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
                             unsafe_allow_html=True)
 
-        if pl_error:
-            st.error(pl_error)
-        elif pl_result:
-            results = pl_result.get("results", [])
-            errors  = pl_result.get("errors", [])
+        if _pl_state["error"]:
+            st.error(_pl_state["error"])
+        elif _pl_state["result"]:
+            results = _pl_state["result"].get("results", [])
+            errors  = _pl_state["result"].get("errors", [])
             md = [f"### Результат: {len(results)} заданий\n"]
             for r in results:
                 tid  = r.get("task_id", "")
