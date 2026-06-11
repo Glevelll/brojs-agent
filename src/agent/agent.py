@@ -19,6 +19,7 @@ from src.agent.prompts import (
     rework_instructions,
 )
 from src.agent.subagents import subagent_specs_without_tools
+from src.agent.runner_tools import solve_task
 from src.agent.solve_tools import SOLVE_TOOLS
 from src.agent.tools import GIT_TOOLS, WEB_TOOLS
 
@@ -75,7 +76,7 @@ _git_names     = {t.name for t in GIT_TOOLS}
 _web_names     = {t.name for t in WEB_TOOLS}
 _solve_names   = {t.name for t in SOLVE_TOOLS}
 
-_main_tool_names = _BUILTIN | _gitea_names
+_main_tool_names = _BUILTIN | _gitea_names | _journal_names | {"solve_task"}
 
 _subagent_tool_names: dict[str, set[str]] = {
     "web_search":                  _BUILTIN | _web_names,
@@ -113,7 +114,7 @@ subagents = [
 
 agent = create_deep_agent(
     model=llm,
-    tools=list(GITEA_TOOLS),
+    tools=[*GITEA_TOOLS, *_journal_tools, solve_task],
     system_prompt=main_agent_instructions,
     backend=_composite_backend,
     memory=[AGENTS_MD_VFS_PATH],

@@ -50,20 +50,30 @@ async def cmd_solve(task_id: str) -> None:
 
 
 async def cmd_run() -> None:
-    """Решить все todo-задания курса."""
-    from src.agent.graph.pipeline import pipeline
+    """Решить все todo-задания курса (LLM-оркестратор управляет всем)."""
+    import time
+    from langchain_core.messages import HumanMessage
+    from src.agent.agent import agent
 
-    print("[cli] Запускаю pipeline для всех todo-заданий...")
-    result = await pipeline.ainvoke(
-        {"tasks": [], "current_index": 0, "results": [], "errors": []}
+    prompt = (
+        "Выполни все задания со статусом todo в курсе KFU-26-1 "
+        "(courseId=698b49da77cb6d4d2e43ce78).\n\n"
+        "Шаги:\n"
+        "1. Получи список заданий через mcp__journal-bh-professor__tasks_list\n"
+        "2. Для каждого задания со статусом todo вызови solve_task(task_id=...)\n"
+        "3. Выполняй строго по одному заданию, жди результата перед следующим\n"
+        "4. Доложи итоговые результаты"
     )
+
+    print("[cli] Агент-оркестратор запущен (LLM управляет всем)...")
+    result = await agent.ainvoke(
+        {"messages": [HumanMessage(content=prompt)]},
+        {"configurable": {"thread_id": f"run-all-{int(time.time())}"}},
+    )
+
+    final = (result.get("messages") or [{}])[-1]
     print(f"\n{'='*60}")
-    for r in result.get("results", []):
-        icon = "✅" if r.get("status") == "ok" else "❌"
-        url  = r.get("url", r.get("error", ""))
-        print(f"  {icon} {r.get('task_id','')[:8]}... → {url}")
-    for e in result.get("errors", []):
-        print(f"  ⚠️  {e}")
+    print(getattr(final, "content", str(final)))
     print('='*60)
 
 

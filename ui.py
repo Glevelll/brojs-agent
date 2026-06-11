@@ -94,14 +94,14 @@ st.markdown("""
 
 @st.cache_resource(show_spinner="Инициализация агента (~30с)...")
 def get_agent():
-    from src.agent.agent import homework_direct_agent
-    return homework_direct_agent
+    from src.agent.agent import agent
+    return agent
 
 
-@st.cache_resource(show_spinner="Загрузка pipeline...")
-def get_pipeline():
-    from src.agent.graph.pipeline import pipeline
-    return pipeline
+@st.cache_resource(show_spinner="Загрузка главного агента...")
+def get_main_agent():
+    from src.agent.agent import agent
+    return agent
 
 # ---------------------------------------------------------------------------
 # Callback — перехватывает события агента и шлёт в очередь
@@ -425,29 +425,45 @@ with tab_pipeline:
 
     st.divider()
     st.subheader("Запустить все todo-задания")
-    if st.button("⚡ Запустить pipeline для всех заданий", use_container_width=True):
-        pl       = get_pipeline()
+    if st.button("⚡ Запустить агент для всех заданий", use_container_width=True):
+        main_ag  = get_main_agent()
         evq_pl   = queue.Queue()
         cb_pl    = AgentCallback(evq_pl)
         all_pl_events: list[dict] = []
         _pl_state = {"result": None, "error": None}
 
-        def _run_pipeline():
+        run_prompt = (
+            "Выполни все задания со статусом todo в курсе KFU-26-1 "
+            "(courseId=698b49da77cb6d4d2e43ce78).\n\n"
+            "Шаги:\n"
+            "1. Получи список заданий через mcp__journal-bh-professor__tasks_list\n"
+            "2. Для каждого задания со статусом todo вызови solve_task(task_id=...)\n"
+            "3. Выполняй строго по одному заданию, жди результата перед следующим\n"
+            "4. Доложи итоговые результаты"
+        )
+
+        def _run_all():
             async def _inner():
                 try:
-                    _pl_state["result"] = await pl.ainvoke(
-                        {"tasks": [], "current_index": 0, "results": [], "errors": []},
-                        {"callbacks": [cb_pl]},
+                    result = await main_ag.ainvoke(
+                        {"messages": [HumanMessage(content=run_prompt)]},
+                        {
+                            "configurable": {"thread_id": f"ui-run-all-{int(time.time())}"},
+                            "callbacks": [cb_pl],
+                        },
                     )
+                    _pl_state["result"] = result
+                    evq_pl.put({"t": "done", "result": result})
                 except Exception as e:
                     _pl_state["error"] = str(e)
+                    evq_pl.put({"t": "fatal", "msg": str(e)})
             asyncio.run(_inner())
 
-        t_pl = threading.Thread(target=_run_pipeline, daemon=True)
+        t_pl = threading.Thread(target=_run_all, daemon=True)
         t_pl.start()
 
         events_pl_ph = st.empty()
-        with st.spinner("Pipeline работает... (может занять несколько минут)"):
+        with st.spinner("Агент-оркестратор работает... (LLM управляет всем)"):
             while t_pl.is_alive() or not evq_pl.empty():
                 while not evq_pl.empty():
                     ev = evq_pl.get_nowait()
@@ -465,7 +481,7 @@ with tab_pipeline:
         events_pl_ph.empty()
 
         if all_pl_events:
-            with st.expander(f"🔍 Лог pipeline ({len(all_pl_events)} событий)", expanded=False):
+            with st.expander(f"🔍 Лог агента ({len(all_pl_events)} событий)", expanded=False):
                 html = "".join(_render_event(e) for e in all_pl_events[-80:])
                 st.markdown(f'<div style="max-height:300px;overflow-y:auto">{html}</div>',
                             unsafe_allow_html=True)
@@ -473,19 +489,13 @@ with tab_pipeline:
         if _pl_state["error"]:
             st.error(_pl_state["error"])
         elif _pl_state["result"]:
-            results = _pl_state["result"].get("results", [])
-            errors  = _pl_state["result"].get("errors", [])
-            md = [f"### Результат: {len(results)} заданий\n"]
-            for r in results:
-                tid  = r.get("task_id", "")
-                url  = f"https://git.brojs.ru/{GITEA_OWNER}/task-{tid}"
-                icon = "✅" if r.get("status") == "ok" else "❌"
-                md.append(f"- {icon} `{tid[:8]}...` — [{r.get('status','')}]({url})")
-            if errors:
-                md.append(f"\n**Ошибки ({len(errors)}):**")
-                for e in errors:
-                    md.append(f"- {e}")
-            st.markdown("\n".join(md))
+            msgs   = _pl_state["result"].get("messages", [])
+            last   = msgs[-1] if msgs else None
+            reply  = last.content if last and hasattr(last, "content") else "Готово."
+            st.markdown(
+                f'<div class="status-ok">✅ Агент завершил работу:<br>{reply[:600]}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -497,31 +507,43 @@ with tab_status:
 
     if st.button("🔄 Обновить статусы", type="primary"):
         with st.spinner("Загружаю статусы..."):
-            try:
-                from src.agent.mcp_client import load_journal_toolsets
+            from src.agent.mcp_client import load_journal_toolsets
 
-                async def _fetch():
-                    j = load_journal_toolsets()
-                    # Инструменты имеют префикс mcp__journal-bh-professor__
-                    tools = {t.name: t for t in j.tasks_submissions_tools}
-                    full_name = "mcp__journal-bh-professor__tasks_list"
-                    t = tools.get(full_name)
-                    if not t:
-                        # fallback: ищем по любому имени содержащему tasks_list
-                        t = next((v for k, v in tools.items() if "tasks_list" in k), None)
-                    if not t:
-                        st.warning(f"Инструмент tasks_list не найден. Доступны: {list(tools.keys())}")
-                        return []
-                    raw  = await t.ainvoke({"courseId": "698b49da77cb6d4d2e43ce78"})
-                    text = next((x["text"] for x in raw if x.get("type") == "text"), str(raw)) if isinstance(raw, list) else str(raw)
-                    data = json.loads(text)
-                    return data.get("tasks", data) if isinstance(data, dict) else data
+            async def _fetch():
+                j = load_journal_toolsets()
+                tools = {t.name: t for t in j.tasks_submissions_tools}
+                full_name = "mcp__journal-bh-professor__tasks_list"
+                t = tools.get(full_name) or next(
+                    (v for k, v in tools.items() if "tasks_list" in k), None
+                )
+                if not t:
+                    return [], f"tasks_list не найден. Доступны: {list(tools.keys())}"
+                raw  = await t.ainvoke({"courseId": "698b49da77cb6d4d2e43ce78"})
+                text = next((x["text"] for x in raw if x.get("type") == "text"), str(raw)) if isinstance(raw, list) else str(raw)
+                data = json.loads(text)
+                return (data.get("tasks", data) if isinstance(data, dict) else data), None
 
-                items = asyncio.run(_fetch())
-                st.session_state["task_statuses"] = items
-            except Exception as e:
-                st.error(str(e))
-                items = []
+            _state = {"items": [], "error": None}
+
+            def _run_fetch():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    _state["items"], _state["error"] = loop.run_until_complete(_fetch())
+                except Exception as e:
+                    _state["error"] = str(e)
+                finally:
+                    loop.close()
+
+            t = threading.Thread(target=_run_fetch, daemon=True)
+            t.start()
+            t.join()
+
+            if _state["error"]:
+                st.error(_state["error"])
+            else:
+                st.session_state["task_statuses"] = _state["items"]
+                st.rerun()
 
     items = st.session_state.get("task_statuses", [])
 
